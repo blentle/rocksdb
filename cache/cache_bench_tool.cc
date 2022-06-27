@@ -3,6 +3,7 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include "cache_key.h"
 #ifdef GFLAGS
 #include <cinttypes>
 #include <cstddef>
@@ -26,6 +27,7 @@
 #include "table/block_based/block_based_table_reader.h"
 #include "table/block_based/cachable_entry.h"
 #include "util/coding.h"
+#include "util/distributed_mutex.h"
 #include "util/gflags_compat.h"
 #include "util/hash.h"
 #include "util/mutexlock.h"
@@ -213,7 +215,8 @@ struct KeyGen {
     EncodeFixed64(key_data + 10, key);
     key_data[18] = char{4};
     EncodeFixed64(key_data + 19, key);
-    return Slice(&key_data[off], sizeof(key_data) - off);
+    assert(27 >= kCacheKeySize);
+    return Slice(&key_data[off], kCacheKeySize);
   }
 };
 
@@ -287,7 +290,9 @@ class CacheBench {
         exit(1);
       }
     } else if (FLAGS_cache_type == "fast_lru_cache") {
-      cache_ = NewFastLRUCache(FLAGS_cache_size, FLAGS_num_shard_bits);
+      cache_ = NewFastLRUCache(
+          FLAGS_cache_size, FLAGS_value_bytes, FLAGS_num_shard_bits,
+          false /*strict_capacity_limit*/, kDefaultCacheMetadataChargePolicy);
     } else if (FLAGS_cache_type == "lru_cache") {
       LRUCacheOptions opts(FLAGS_cache_size, FLAGS_num_shard_bits, false, 0.5);
 #ifndef ROCKSDB_LITE
@@ -318,8 +323,9 @@ class CacheBench {
     Random64 rnd(1);
     KeyGen keygen;
     for (uint64_t i = 0; i < 2 * FLAGS_cache_size; i += FLAGS_value_bytes) {
-      cache_->Insert(keygen.GetRand(rnd, max_key_, max_log_), createValue(rnd),
-                     &helper1, FLAGS_value_bytes);
+      Status s = cache_->Insert(keygen.GetRand(rnd, max_key_, max_log_),
+                                createValue(rnd), &helper1, FLAGS_value_bytes);
+      assert(s.ok());
     }
   }
 
@@ -539,8 +545,9 @@ class CacheBench {
                              FLAGS_value_bytes);
         } else {
           // do insert
-          cache_->Insert(key, createValue(thread->rnd), &helper2,
-                         FLAGS_value_bytes, &handle);
+          Status s = cache_->Insert(key, createValue(thread->rnd), &helper2,
+                                    FLAGS_value_bytes, &handle);
+          assert(s.ok());
         }
       } else if (random_op < insert_threshold_) {
         if (handle) {
@@ -548,8 +555,9 @@ class CacheBench {
           handle = nullptr;
         }
         // do insert
-        cache_->Insert(key, createValue(thread->rnd), &helper3,
-                       FLAGS_value_bytes, &handle);
+        Status s = cache_->Insert(key, createValue(thread->rnd), &helper3,
+                                  FLAGS_value_bytes, &handle);
+        assert(s.ok());
       } else if (random_op < lookup_threshold_) {
         if (handle) {
           cache_->Release(handle);
@@ -585,7 +593,15 @@ class CacheBench {
   }
 
   void PrintEnv() const {
+#if defined(__GNUC__) && !defined(__OPTIMIZE__)
+    printf(
+        "WARNING: Optimization is disabled: benchmarks unnecessarily slow\n");
+#endif
+#ifndef NDEBUG
+    printf("WARNING: Assertions are enabled; benchmarks unnecessarily slow\n");
+#endif
     printf("RocksDB version     : %d.%d\n", kMajorVersion, kMinorVersion);
+    printf("DMutex impl name    : %s\n", DMutex::kName());
     printf("Number of threads   : %u\n", FLAGS_threads);
     printf("Ops per thread      : %" PRIu64 "\n", FLAGS_ops_per_thread);
     printf("Cache size          : %s\n",

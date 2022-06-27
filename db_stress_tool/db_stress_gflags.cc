@@ -305,7 +305,7 @@ DEFINE_int64(cache_size, 2LL * KB * KB * KB,
 DEFINE_int32(cache_numshardbits, 6,
              "Number of shards for the block cache"
              " is 2 ** cache_numshardbits. Negative means use default settings."
-             " This is applied only if FLAGS_cache_size is non-negative.");
+             " This is applied only if FLAGS_cache_size is greater than 0.");
 
 DEFINE_bool(cache_index_and_filter_blocks, false,
             "True if indexes/filters should be cached in block cache.");
@@ -324,6 +324,11 @@ DEFINE_bool(charge_table_reader, false,
             "Setting for "
             "CacheEntryRoleOptions::charged of"
             "CacheEntryRole::kBlockBasedTableReader");
+
+DEFINE_bool(charge_file_metadata, false,
+            "Setting for "
+            "CacheEntryRoleOptions::charged of"
+            "kFileMetadata");
 
 DEFINE_int32(
     top_level_index_pinning,
@@ -445,6 +450,26 @@ DEFINE_int32(
     "[Integrated BlobDB] Enable writing blob files during flushes and "
     "compactions starting from the specified level.");
 
+DEFINE_bool(use_blob_cache, false, "[Integrated BlobDB] Enable blob cache.");
+
+DEFINE_bool(
+    use_shared_block_and_blob_cache, true,
+    "[Integrated BlobDB] Use a shared backing cache for both block "
+    "cache and blob cache. It only takes effect if use_blob_cache is enabled.");
+
+DEFINE_uint64(
+    blob_cache_size, 2LL * KB * KB * KB,
+    "[Integrated BlobDB] Number of bytes to use as a cache of blobs. It only "
+    "takes effect if the block and blob caches are different "
+    "(use_shared_block_and_blob_cache = false).");
+
+DEFINE_int32(blob_cache_numshardbits, 6,
+             "[Integrated BlobDB] Number of shards for the blob cache is 2 ** "
+             "blob_cache_numshardbits. Negative means use default settings. "
+             "It only takes effect if blob_cache_size is greater than 0, and "
+             "the block and blob caches are different "
+             "(use_shared_block_and_blob_cache = false).");
+
 static const bool FLAGS_subcompactions_dummy __attribute__((__unused__)) =
     RegisterFlagValidator(&FLAGS_subcompactions, &ValidateUint32Range);
 
@@ -463,10 +488,6 @@ static const bool FLAGS_reopen_dummy __attribute__((__unused__)) =
 DEFINE_double(bloom_bits, 10,
               "Bloom filter bits per key. "
               "Negative means use default settings.");
-
-DEFINE_bool(use_block_based_filter, false,
-            "use block based filter"
-            "instead of full filter for block based table");
 
 DEFINE_int32(
     ribbon_starting_level, 999,
@@ -492,8 +513,14 @@ DEFINE_bool(
 DEFINE_int32(
     index_type,
     static_cast<int32_t>(
-        ROCKSDB_NAMESPACE::BlockBasedTableOptions::kBinarySearch),
+        ROCKSDB_NAMESPACE::BlockBasedTableOptions().index_type),
     "Type of block-based table index (see `enum IndexType` in table.h)");
+
+DEFINE_int32(
+    data_block_index_type,
+    static_cast<int32_t>(
+        ROCKSDB_NAMESPACE::BlockBasedTableOptions().data_block_index_type),
+    "Index type for data blocks (see `enum DataBlockIndexType` in table.h)");
 
 DEFINE_string(db, "", "Use the db with the following name.");
 
@@ -970,5 +997,9 @@ DEFINE_bool(
 DEFINE_int32(
     create_timestamped_snapshot_one_in, 0,
     "On non-zero, create timestamped snapshots upon transaction commits.");
+
+DEFINE_bool(allow_data_in_errors,
+            ROCKSDB_NAMESPACE::Options().allow_data_in_errors,
+            "If true, allow logging data, e.g. key, value in LOG files.");
 
 #endif  // GFLAGS

@@ -15,8 +15,7 @@ DEFINE_SYNC_AND_ASYNC(Status, Version::MultiGetFromSST)
 (const ReadOptions& read_options, MultiGetRange file_range, int hit_file_level,
  bool is_hit_file_last_in_level, FdWithKeyRange* f,
  std::unordered_map<uint64_t, BlobReadRequests>& blob_rqs,
- uint64_t& num_filter_read, uint64_t& num_index_read, uint64_t& num_data_read,
- uint64_t& num_sst_read) {
+ uint64_t& num_filter_read, uint64_t& num_index_read, uint64_t& num_sst_read) {
   bool timer_enabled = GetPerfLevel() >= PerfLevel::kEnableTimeExceptForMutex &&
                        get_perf_context()->per_level_perf_context_enabled;
 
@@ -63,12 +62,10 @@ DEFINE_SYNC_AND_ASYNC(Status, Version::MultiGetFromSST)
     batch_size++;
     num_index_read += get_context.get_context_stats_.num_index_read;
     num_filter_read += get_context.get_context_stats_.num_filter_read;
-    num_data_read += get_context.get_context_stats_.num_data_read;
     num_sst_read += get_context.get_context_stats_.num_sst_read;
     // Reset these stats since they're specific to a level
     get_context.get_context_stats_.num_index_read = 0;
     get_context.get_context_stats_.num_filter_read = 0;
-    get_context.get_context_stats_.num_data_read = 0;
     get_context.get_context_stats_.num_sst_read = 0;
 
     // report the counters before returning
@@ -142,6 +139,11 @@ DEFINE_SYNC_AND_ASYNC(Status, Version::MultiGetFromSST)
         *status = Status::NotSupported(
             "Encounter unexpected blob index. Please open DB with "
             "ROCKSDB_NAMESPACE::blob_db::BlobDB instead.");
+        file_range.MarkKeyDone(iter);
+        continue;
+      case GetContext::kUnexpectedWideColumnEntity:
+        *status =
+            Status::NotSupported("Encountered unexpected wide-column entity");
         file_range.MarkKeyDone(iter);
         continue;
     }

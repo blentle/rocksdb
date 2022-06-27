@@ -670,7 +670,7 @@ class DBBlockCacheTest1 : public DBTestBase,
 };
 
 INSTANTIATE_TEST_CASE_P(DBBlockCacheTest1, DBBlockCacheTest1,
-                        ::testing::Values(1, 2, 3));
+                        ::testing::Values(1, 2));
 
 TEST_P(DBBlockCacheTest1, WarmCacheWithBlocksDuringFlush) {
   Options options = CurrentOptions();
@@ -686,13 +686,10 @@ TEST_P(DBBlockCacheTest1, WarmCacheWithBlocksDuringFlush) {
       table_options.partition_filters = true;
       table_options.index_type =
           BlockBasedTableOptions::IndexType::kTwoLevelIndexSearch;
-      table_options.filter_policy.reset(NewBloomFilterPolicy(10, false));
+      table_options.filter_policy.reset(NewBloomFilterPolicy(10));
       break;
-    case 2:  // block-based filter
-      table_options.filter_policy.reset(NewBloomFilterPolicy(10, true));
-      break;
-    case 3:  // full filter
-      table_options.filter_policy.reset(NewBloomFilterPolicy(10, false));
+    case 2:  // full filter
+      table_options.filter_policy.reset(NewBloomFilterPolicy(10));
       break;
     default:
       assert(false);
@@ -936,7 +933,9 @@ TEST_F(DBBlockCacheTest, AddRedundantStats) {
   for (std::shared_ptr<Cache> base_cache :
        {NewLRUCache(capacity, num_shard_bits),
         NewClockCache(capacity, num_shard_bits),
-        NewFastLRUCache(capacity, num_shard_bits)}) {
+        NewFastLRUCache(capacity, 1 /*estimated_value_size*/, num_shard_bits,
+                        false /*strict_capacity_limit*/,
+                        kDefaultCacheMetadataChargePolicy)}) {
     if (!base_cache) {
       // Skip clock cache when not supported
       continue;

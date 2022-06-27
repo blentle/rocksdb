@@ -36,16 +36,7 @@ std::shared_ptr<const FilterPolicy> CreateFilterPolicy() {
     return BlockBasedTableOptions().filter_policy;
   }
   const FilterPolicy* new_policy;
-  if (FLAGS_use_block_based_filter) {
-    if (FLAGS_ribbon_starting_level < 999) {
-      fprintf(
-          stderr,
-          "Cannot combine use_block_based_filter and ribbon_starting_level\n");
-      exit(1);
-    } else {
-      new_policy = NewBloomFilterPolicy(FLAGS_bloom_bits, true);
-    }
-  } else if (FLAGS_ribbon_starting_level >= 999) {
+  if (FLAGS_ribbon_starting_level >= 999) {
     // Use Bloom API
     new_policy = NewBloomFilterPolicy(FLAGS_bloom_bits, false);
   } else {
@@ -66,6 +57,7 @@ StressTest::StressTest()
 #ifndef ROCKSDB_LITE
       txn_db_(nullptr),
 #endif
+      db_aptr_(nullptr),
       clock_(db_stress_env->GetSystemClock().get()),
       new_column_family_name_(1),
       num_times_reopened_(0),
@@ -129,7 +121,9 @@ std::shared_ptr<Cache> StressTest::NewCache(size_t capacity,
     }
     return cache;
   } else if (FLAGS_cache_type == "fast_lru_cache") {
-    return NewFastLRUCache((size_t)capacity, num_shard_bits);
+    return NewFastLRUCache(static_cast<size_t>(capacity), FLAGS_block_size,
+                           num_shard_bits, false /*strict_capacity_limit*/,
+                           kDefaultCacheMetadataChargePolicy);
   } else if (FLAGS_cache_type == "lru_cache") {
     LRUCacheOptions opts;
     opts.capacity = capacity;
@@ -199,6 +193,8 @@ bool StressTest::BuildOptionsTable() {
       {"memtable_huge_page_size", {"0", std::to_string(2 * 1024 * 1024)}},
       {"max_successive_merges", {"0", "2", "4"}},
       {"inplace_update_num_locks", {"100", "200", "300"}},
+      // TODO: re-enable once internal task T124324915 is fixed.
+      // {"experimental_mempurge_threshold", {"0.0", "1.0"}},
       // TODO(ljin): enable test for this option
       // {"disable_auto_compactions", {"100", "200", "300"}},
       {"level0_file_num_compaction_trigger",
@@ -623,6 +619,7 @@ void StressTest::OperateDb(ThreadState* thread) {
     write_opts.sync = true;
   }
   write_opts.disableWAL = FLAGS_disable_wal;
+  write_opts.protection_bytes_per_key = FLAGS_batch_protection_bytes_per_key;
   const int prefix_bound = static_cast<int>(FLAGS_readpercent) +
                            static_cast<int>(FLAGS_prefixpercent);
   const int write_bound = prefix_bound + static_cast<int>(FLAGS_writepercent);
@@ -2339,6 +2336,17 @@ void StressTest::Open(SharedState* shared) {
           options_.blob_compaction_readahead_size,
           options_.blob_file_starting_level);
 
+  if (FLAGS_use_blob_cache) {
+    fprintf(stdout,
+            "Integrated BlobDB: blob cache enabled, block and blob caches "
+            "shared: %d, blob cache size %" PRIu64
+            ", blob cache num shard bits: %d\n",
+            FLAGS_use_shared_block_and_blob_cache, FLAGS_blob_cache_size,
+            FLAGS_blob_cache_numshardbits);
+  } else {
+    fprintf(stdout, "Integrated BlobDB: blob cache disabled\n");
+  }
+
   fprintf(stdout, "DB path: [%s]\n", FLAGS_db.c_str());
 
   Status s;
@@ -2541,7 +2549,13 @@ void StressTest::Open(SharedState* shared) {
         fflush(stderr);
       }
       assert(s.ok());
-      db_ = txn_db_;
+
+      // Do not swap the order of the following.
+      {
+        db_ = txn_db_;
+        db_aptr_.store(txn_db_, std::memory_order_release);
+      }
+
       // after a crash, rollback to commit recovered transactions
       std::vector<Transaction*> trans;
       txn_db_->GetAllPreparedTransactions(&trans);
@@ -2757,6 +2771,11 @@ void InitializeOptionsFromFlags(
        {/*.charged = */ FLAGS_charge_table_reader
             ? CacheEntryRoleOptions::Decision::kEnabled
             : CacheEntryRoleOptions::Decision::kDisabled}});
+  block_based_options.cache_usage_options.options_overrides.insert(
+      {CacheEntryRole::kFileMetadata,
+       {/*.charged = */ FLAGS_charge_file_metadata
+            ? CacheEntryRoleOptions::Decision::kEnabled
+            : CacheEntryRoleOptions::Decision::kDisabled}});
   block_based_options.format_version =
       static_cast<uint32_t>(FLAGS_format_version);
   block_based_options.index_block_restart_interval =
@@ -2769,6 +2788,9 @@ void InitializeOptionsFromFlags(
       FLAGS_detect_filter_construct_corruption;
   block_based_options.index_type =
       static_cast<BlockBasedTableOptions::IndexType>(FLAGS_index_type);
+  block_based_options.data_block_index_type =
+      static_cast<BlockBasedTableOptions::DataBlockIndexType>(
+          FLAGS_data_block_index_type);
   block_based_options.prepopulate_block_cache =
       static_cast<BlockBasedTableOptions::PrepopulateBlockCache>(
           FLAGS_prepopulate_block_cache);
@@ -2877,6 +2899,24 @@ void InitializeOptionsFromFlags(
   options.blob_compaction_readahead_size = FLAGS_blob_compaction_readahead_size;
   options.blob_file_starting_level = FLAGS_blob_file_starting_level;
 
+  if (FLAGS_use_blob_cache) {
+    if (FLAGS_use_shared_block_and_blob_cache) {
+      options.blob_cache = cache;
+    } else {
+      if (FLAGS_blob_cache_size > 0) {
+        LRUCacheOptions co;
+        co.capacity = FLAGS_blob_cache_size;
+        co.num_shard_bits = FLAGS_blob_cache_numshardbits;
+        options.blob_cache = NewLRUCache(co);
+      } else {
+        fprintf(stderr,
+                "Unable to create a standalone blob cache if blob_cache_size "
+                "<= 0.\n");
+        exit(1);
+      }
+    }
+  }
+
   options.wal_compression =
       StringToCompressionType(FLAGS_wal_compression.c_str());
 
@@ -2917,6 +2957,8 @@ void InitializeOptionsFromFlags(
   if (FLAGS_user_timestamp_size > 0) {
     CheckAndSetOptionsForUserTimestamp(options);
   }
+
+  options.allow_data_in_errors = FLAGS_allow_data_in_errors;
 }
 
 void InitializeOptionsGeneral(

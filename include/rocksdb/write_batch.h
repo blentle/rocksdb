@@ -100,6 +100,11 @@ class WriteBatch : public WriteBatchBase {
     return Put(nullptr, key, value);
   }
 
+  // UNDER CONSTRUCTION -- DO NOT USE
+  using WriteBatchBase::PutEntity;
+  Status PutEntity(ColumnFamilyHandle* column_family, const Slice& key,
+                   const WideColumns& columns) override;
+
   using WriteBatchBase::Delete;
   // If the database contains a mapping for "key", erase it.  Else do nothing.
   // The following Delete(..., const Slice& key) can be used when user-defined
@@ -240,6 +245,12 @@ class WriteBatch : public WriteBatchBase {
     }
     virtual void Put(const Slice& /*key*/, const Slice& /*value*/) {}
 
+    virtual Status PutEntityCF(uint32_t /* column_family_id */,
+                               const Slice& /* key */,
+                               const Slice& /* entity */) {
+      return Status::NotSupported("PutEntityCF not implemented");
+    }
+
     virtual Status DeleteCF(uint32_t column_family_id, const Slice& key) {
       if (column_family_id == 0) {
         Delete(key);
@@ -346,6 +357,9 @@ class WriteBatch : public WriteBatchBase {
   // Returns true if PutCF will be called during Iterate
   bool HasPut() const;
 
+  // Returns true if PutEntityCF will be called during Iterate
+  bool HasPutEntity() const;
+
   // Returns true if DeleteCF will be called during Iterate
   bool HasDelete() const;
 
@@ -391,6 +405,12 @@ class WriteBatch : public WriteBatchBase {
   Status UpdateTimestamps(const Slice& ts,
                           std::function<size_t(uint32_t /*cf*/)> ts_sz_func);
 
+  // Verify the per-key-value checksums of this write batch.
+  // Corruption status will be returned if the verification fails.
+  // If this write batch does not have per-key-value checksum,
+  // OK status will be returned.
+  Status VerifyChecksum() const;
+
   using WriteBatchBase::GetWriteBatch;
   WriteBatch* GetWriteBatch() override { return this; }
 
@@ -412,9 +432,6 @@ class WriteBatch : public WriteBatchBase {
 
   struct ProtectionInfo;
   size_t GetProtectionBytesPerKey() const;
-
-  // Clears prot_info_ if there are no entries.
-  void ClearProtectionInfoIfEmpty();
 
  private:
   friend class WriteBatchInternal;
