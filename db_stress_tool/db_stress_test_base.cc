@@ -114,7 +114,9 @@ std::shared_ptr<Cache> StressTest::NewCache(size_t capacity,
   }
 
   if (FLAGS_cache_type == "clock_cache") {
-    auto cache = NewClockCache((size_t)capacity);
+    auto cache = NewClockCache(static_cast<size_t>(capacity), FLAGS_block_size,
+                               num_shard_bits, false /*strict_capacity_limit*/,
+                               kDefaultCacheMetadataChargePolicy);
     if (!cache) {
       fprintf(stderr, "Clock cache not supported.");
       exit(1);
@@ -1808,6 +1810,16 @@ void StressTest::TestGetProperty(ThreadState* thread) const {
   unknownPropertyNames.insert(levelPropertyNames.begin(),
                               levelPropertyNames.end());
 
+  std::unordered_set<std::string> blobCachePropertyNames = {
+      DB::Properties::kBlobCacheCapacity,
+      DB::Properties::kBlobCacheUsage,
+      DB::Properties::kBlobCachePinnedUsage,
+  };
+  if (db_->GetOptions().blob_cache == nullptr) {
+    unknownPropertyNames.insert(blobCachePropertyNames.begin(),
+                                blobCachePropertyNames.end());
+  }
+
   std::string prop;
   for (const auto& ppt_name_and_info : InternalStats::ppt_name_to_info) {
     bool res = db_->GetProperty(ppt_name_and_info.first, &prop);
@@ -2259,6 +2271,25 @@ void StressTest::PrintEnv() const {
           FLAGS_periodic_compaction_seconds);
   fprintf(stdout, "Compaction TTL            : %" PRIu64 "\n",
           FLAGS_compaction_ttl);
+  const char* compaction_pri = "";
+  switch (FLAGS_compaction_pri) {
+    case kByCompensatedSize:
+      compaction_pri = "kByCompensatedSize";
+      break;
+    case kOldestLargestSeqFirst:
+      compaction_pri = "kOldestLargestSeqFirst";
+      break;
+    case kOldestSmallestSeqFirst:
+      compaction_pri = "kOldestSmallestSeqFirst";
+      break;
+    case kMinOverlappingRatio:
+      compaction_pri = "kMinOverlappingRatio";
+      break;
+    case kRoundRobin:
+      compaction_pri = "kRoundRobin";
+      break;
+  }
+  fprintf(stdout, "Compaction Pri            : %s\n", compaction_pri);
   fprintf(stdout, "Background Purge          : %d\n",
           static_cast<int>(FLAGS_avoid_unnecessary_blocking_io));
   fprintf(stdout, "Write DB ID to manifest   : %d\n",
@@ -2697,10 +2728,6 @@ void CheckAndSetOptionsForUserTimestamp(Options& options) {
     exit(1);
   }
 #endif  // !ROCKSDB_LITE
-  if (FLAGS_enable_compaction_filter) {
-    fprintf(stderr, "CompactionFilter not supported with timestamp.\n");
-    exit(1);
-  }
   if (FLAGS_test_cf_consistency || FLAGS_test_batches_snapshots) {
     fprintf(stderr,
             "Due to per-key ts-seq ordering constraint, only the (default) "
@@ -2812,6 +2839,8 @@ void InitializeOptionsFromFlags(
   options.max_background_flushes = FLAGS_max_background_flushes;
   options.compaction_style =
       static_cast<ROCKSDB_NAMESPACE::CompactionStyle>(FLAGS_compaction_style);
+  options.compaction_pri =
+      static_cast<ROCKSDB_NAMESPACE::CompactionPri>(FLAGS_compaction_pri);
   if (FLAGS_prefix_size >= 0) {
     options.prefix_extractor.reset(NewFixedPrefixTransform(FLAGS_prefix_size));
   }
