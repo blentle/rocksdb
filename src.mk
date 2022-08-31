@@ -4,12 +4,14 @@ LIB_SOURCES =                                                   \
   cache/cache_entry_roles.cc                                    \
   cache/cache_key.cc                                            \
   cache/cache_reservation_manager.cc                            \
+  cache/charged_cache.cc                                        \
   cache/clock_cache.cc                                          \
   cache/fast_lru_cache.cc                                       \
   cache/lru_cache.cc                                            \
   cache/compressed_secondary_cache.cc                           \
   cache/sharded_cache.cc                                        \
   db/arena_wrapped_db_iter.cc                                   \
+  db/blob/blob_contents.cc                                      \
   db/blob/blob_fetcher.cc                                       \
   db/blob/blob_file_addition.cc                                 \
   db/blob/blob_file_builder.cc                                  \
@@ -72,7 +74,7 @@ LIB_SOURCES =                                                   \
   db/merge_helper.cc                                            \
   db/merge_operator.cc                                          \
   db/output_validator.cc                                        \
-  db/periodic_work_scheduler.cc                                 \
+  db/periodic_task_scheduler.cc                                 \
   db/range_del_aggregator.cc                                    \
   db/range_tombstone_fragmenter.cc                              \
   db/repair.cc                                                  \
@@ -89,6 +91,7 @@ LIB_SOURCES =                                                   \
   db/wal_edit.cc                                                \
   db/wal_manager.cc                                             \
   db/wide/wide_column_serialization.cc                          \
+  db/wide/wide_columns.cc                                       \
   db/write_batch.cc                                             \
   db/write_batch_base.cc                                        \
   db/write_controller.cc                                        \
@@ -237,6 +240,7 @@ LIB_SOURCES =                                                   \
   util/slice.cc                                                 \
   util/file_checksum_helper.cc                                  \
   util/status.cc                                                \
+  util/stderr_logger.cc                                         \
   util/string_util.cc                                           \
   util/thread_local.cc                                          \
   util/threadpool_imp.cc                                        \
@@ -498,7 +502,7 @@ TEST_MAIN_SOURCES =                                                     \
   db/obsolete_files_test.cc                                             \
   db/options_file_test.cc                                               \
   db/perf_context_test.cc                                               \
-  db/periodic_work_scheduler_test.cc                                    \
+  db/periodic_task_scheduler_test.cc                                    \
   db/plain_table_db_test.cc                                             \
   db/prefix_test.cc                                                     \
   db/repair_test.cc                                                     \

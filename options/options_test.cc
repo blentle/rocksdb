@@ -128,7 +128,7 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
       {"blob_compaction_readahead_size", "256K"},
       {"blob_file_starting_level", "1"},
       {"prepopulate_blob_cache", "kDisable"},
-      {"bottommost_temperature", "kWarm"},
+      {"last_level_temperature", "kWarm"},
   };
 
   std::unordered_map<std::string, std::string> db_options_map = {
@@ -268,6 +268,7 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
   ASSERT_EQ(new_cf_opt.blob_compaction_readahead_size, 262144);
   ASSERT_EQ(new_cf_opt.blob_file_starting_level, 1);
   ASSERT_EQ(new_cf_opt.prepopulate_blob_cache, PrepopulateBlobCache::kDisable);
+  ASSERT_EQ(new_cf_opt.last_level_temperature, Temperature::kWarm);
   ASSERT_EQ(new_cf_opt.bottommost_temperature, Temperature::kWarm);
 
   cf_options_map["write_buffer_size"] = "hello";
@@ -2359,7 +2360,7 @@ TEST_F(OptionsOldApiTest, GetOptionsFromMapTest) {
       {"blob_compaction_readahead_size", "256K"},
       {"blob_file_starting_level", "1"},
       {"prepopulate_blob_cache", "kDisable"},
-      {"bottommost_temperature", "kWarm"},
+      {"last_level_temperature", "kWarm"},
   };
 
   std::unordered_map<std::string, std::string> db_options_map = {
@@ -2493,6 +2494,7 @@ TEST_F(OptionsOldApiTest, GetOptionsFromMapTest) {
   ASSERT_EQ(new_cf_opt.blob_compaction_readahead_size, 262144);
   ASSERT_EQ(new_cf_opt.blob_file_starting_level, 1);
   ASSERT_EQ(new_cf_opt.prepopulate_blob_cache, PrepopulateBlobCache::kDisable);
+  ASSERT_EQ(new_cf_opt.last_level_temperature, Temperature::kWarm);
   ASSERT_EQ(new_cf_opt.bottommost_temperature, Temperature::kWarm);
 
   cf_options_map["write_buffer_size"] = "hello";
@@ -4956,6 +4958,22 @@ TEST_F(ConfigOptionsTest, MergeOperatorFromString) {
   delimiter = copy->GetOptions<std::string>("Delimiter");
   ASSERT_NE(delimiter, nullptr);
   ASSERT_EQ(*delimiter, "&&");
+}
+
+TEST_F(ConfigOptionsTest, ConfiguringOptionsDoesNotRevertRateLimiterBandwidth) {
+  // Regression test for bug where rate limiter's dynamically set bandwidth
+  // could be silently reverted when configuring an options structure with an
+  // existing `rate_limiter`.
+  Options base_options;
+  base_options.rate_limiter.reset(
+      NewGenericRateLimiter(1 << 20 /* rate_bytes_per_sec */));
+  Options copy_options(base_options);
+
+  base_options.rate_limiter->SetBytesPerSecond(2 << 20);
+  ASSERT_EQ(2 << 20, base_options.rate_limiter->GetBytesPerSecond());
+
+  ASSERT_OK(GetOptionsFromString(base_options, "", &copy_options));
+  ASSERT_EQ(2 << 20, base_options.rate_limiter->GetBytesPerSecond());
 }
 
 INSTANTIATE_TEST_CASE_P(OptionsSanityCheckTest, OptionsSanityCheckTest,

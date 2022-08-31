@@ -45,7 +45,7 @@
 #include "db/memtable_list.h"
 #include "db/merge_context.h"
 #include "db/merge_helper.h"
-#include "db/periodic_work_scheduler.h"
+#include "db/periodic_task_scheduler.h"
 #include "db/range_tombstone_fragmenter.h"
 #include "db/table_cache.h"
 #include "db/table_properties_collector.h"
@@ -185,7 +185,7 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
       log_dir_synced_(false),
       log_empty_(true),
       persist_stats_cf_handle_(nullptr),
-      log_sync_cv_(&mutex_),
+      log_sync_cv_(&log_write_mutex_),
       total_log_size_(0),
       is_snapshot_supported_(true),
       write_buffer_manager_(immutable_db_options_.write_buffer_manager.get()),
@@ -217,7 +217,7 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
       refitting_level_(false),
       opened_successfully_(false),
 #ifndef ROCKSDB_LITE
-      periodic_work_scheduler_(nullptr),
+      periodic_task_scheduler_(),
 #endif  // ROCKSDB_LITE
       two_write_queues_(options.two_write_queues),
       manual_wal_flush_(options.manual_wal_flush),
@@ -260,6 +260,18 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
   SetDbSessionId();
   assert(!db_session_id_.empty());
 
+#ifndef ROCKSDB_LITE
+  periodic_task_functions_.emplace(PeriodicTaskType::kDumpStats,
+                                   [this]() { this->DumpStats(); });
+  periodic_task_functions_.emplace(PeriodicTaskType::kPersistStats,
+                                   [this]() { this->PersistStats(); });
+  periodic_task_functions_.emplace(PeriodicTaskType::kFlushInfoLog,
+                                   [this]() { this->FlushInfoLog(); });
+  periodic_task_functions_.emplace(
+      PeriodicTaskType::kRecordSeqnoTime,
+      [this]() { this->RecordSeqnoToTimeMapping(); });
+#endif  // ROCKSDB_LITE
+
   versions_.reset(new VersionSet(dbname_, &immutable_db_options_, file_options_,
                                  table_cache_.get(), write_buffer_manager_,
                                  &write_controller_, &block_cache_tracer_,
@@ -273,6 +285,8 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
   mutable_db_options_.Dump(immutable_db_options_.info_log.get());
   DumpSupportInfo(immutable_db_options_.info_log.get());
 
+  max_total_wal_size_.store(mutable_db_options_.max_total_wal_size,
+                            std::memory_order_relaxed);
   if (write_buffer_manager_) {
     wbm_stall_.reset(new WBMStallInterface());
   }
@@ -478,9 +492,15 @@ void DBImpl::CancelAllBackgroundWork(bool wait) {
                  "Shutdown: canceling all background work");
 
 #ifndef ROCKSDB_LITE
-  if (periodic_work_scheduler_ != nullptr) {
-    periodic_work_scheduler_->Unregister(this);
-    periodic_work_scheduler_->UnregisterRecordSeqnoTimeWorker(this);
+  for (uint8_t task_type = 0;
+       task_type < static_cast<uint8_t>(PeriodicTaskType::kMax); task_type++) {
+    Status s = periodic_task_scheduler_.Unregister(
+        static_cast<PeriodicTaskType>(task_type));
+    if (!s.ok()) {
+      ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                     "Failed to unregister periodic task %d, status: %s",
+                     task_type, s.ToString().c_str());
+    }
   }
 #endif  // !ROCKSDB_LITE
 
@@ -625,26 +645,28 @@ Status DBImpl::CloseHelper() {
     job_context.Clean();
     mutex_.Lock();
   }
-
-  for (auto l : logs_to_free_) {
-    delete l;
-  }
-  for (auto& log : logs_) {
-    uint64_t log_number = log.writer->get_log_number();
-    Status s = log.ClearWriter();
-    if (!s.ok()) {
-      ROCKS_LOG_WARN(
-          immutable_db_options_.info_log,
-          "Unable to Sync WAL file %s with error -- %s",
-          LogFileName(immutable_db_options_.GetWalDir(), log_number).c_str(),
-          s.ToString().c_str());
-      // Retain the first error
-      if (ret.ok()) {
-        ret = s;
+  {
+    InstrumentedMutexLock lock(&log_write_mutex_);
+    for (auto l : logs_to_free_) {
+      delete l;
+    }
+    for (auto& log : logs_) {
+      uint64_t log_number = log.writer->get_log_number();
+      Status s = log.ClearWriter();
+      if (!s.ok()) {
+        ROCKS_LOG_WARN(
+            immutable_db_options_.info_log,
+            "Unable to Sync WAL file %s with error -- %s",
+            LogFileName(immutable_db_options_.GetWalDir(), log_number).c_str(),
+            s.ToString().c_str());
+        // Retain the first error
+        if (ret.ok()) {
+          ret = s;
+        }
       }
     }
+    logs_.clear();
   }
-  logs_.clear();
 
   // Table cache may have table handles holding blocks from the block cache.
   // We need to release them before the block cache is destroyed. The block
@@ -763,30 +785,50 @@ void DBImpl::PrintStatistics() {
   }
 }
 
-Status DBImpl::StartPeriodicWorkScheduler() {
+Status DBImpl::StartPeriodicTaskScheduler() {
 #ifndef ROCKSDB_LITE
 
 #ifndef NDEBUG
   // It only used by test to disable scheduler
   bool disable_scheduler = false;
   TEST_SYNC_POINT_CALLBACK(
-      "DBImpl::StartPeriodicWorkScheduler:DisableScheduler",
+      "DBImpl::StartPeriodicTaskScheduler:DisableScheduler",
       &disable_scheduler);
   if (disable_scheduler) {
     return Status::OK();
   }
-#endif  // !NDEBUG
 
   {
     InstrumentedMutexLock l(&mutex_);
-    periodic_work_scheduler_ = PeriodicWorkScheduler::Default();
-    TEST_SYNC_POINT_CALLBACK("DBImpl::StartPeriodicWorkScheduler:Init",
-                             &periodic_work_scheduler_);
+    TEST_SYNC_POINT_CALLBACK("DBImpl::StartPeriodicTaskScheduler:Init",
+                             &periodic_task_scheduler_);
   }
 
-  return periodic_work_scheduler_->Register(
-      this, mutable_db_options_.stats_dump_period_sec,
-      mutable_db_options_.stats_persist_period_sec);
+#endif  // !NDEBUG
+  if (mutable_db_options_.stats_dump_period_sec > 0) {
+    Status s = periodic_task_scheduler_.Register(
+        PeriodicTaskType::kDumpStats,
+        periodic_task_functions_.at(PeriodicTaskType::kDumpStats),
+        mutable_db_options_.stats_dump_period_sec);
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  if (mutable_db_options_.stats_persist_period_sec > 0) {
+    Status s = periodic_task_scheduler_.Register(
+        PeriodicTaskType::kPersistStats,
+        periodic_task_functions_.at(PeriodicTaskType::kPersistStats),
+        mutable_db_options_.stats_persist_period_sec);
+    if (!s.ok()) {
+      return s;
+    }
+  }
+
+  Status s = periodic_task_scheduler_.Register(
+      PeriodicTaskType::kFlushInfoLog,
+      periodic_task_functions_.at(PeriodicTaskType::kFlushInfoLog));
+
+  return s;
 #else
   return Status::OK();
 #endif  // !ROCKSDB_LITE
@@ -794,9 +836,6 @@ Status DBImpl::StartPeriodicWorkScheduler() {
 
 Status DBImpl::RegisterRecordSeqnoTimeWorker() {
 #ifndef ROCKSDB_LITE
-  if (!periodic_work_scheduler_) {
-    return Status::OK();
-  }
   uint64_t min_time_duration = std::numeric_limits<uint64_t>::max();
   uint64_t max_time_duration = std::numeric_limits<uint64_t>::min();
   {
@@ -823,16 +862,16 @@ Status DBImpl::RegisterRecordSeqnoTimeWorker() {
         min_time_duration / SeqnoToTimeMapping::kMaxSeqnoTimePairsPerCF;
   }
 
-  Status s = periodic_work_scheduler_->RegisterRecordSeqnoTimeWorker(
-      this, seqno_time_cadence);
-  if (s.IsNotSupported()) {
-    // TODO: Fix the timer cannot cancel and re-add the same task
-    ROCKS_LOG_WARN(
-        immutable_db_options_.info_log,
-        "Updating seqno to time worker cadence is not supported yet, to make "
-        "the change effective, please reopen the DB instance.");
-    s = Status::OK();
+  Status s;
+  if (seqno_time_cadence == 0) {
+    s = periodic_task_scheduler_.Unregister(PeriodicTaskType::kRecordSeqnoTime);
+  } else {
+    s = periodic_task_scheduler_.Register(
+        PeriodicTaskType::kRecordSeqnoTime,
+        periodic_task_functions_.at(PeriodicTaskType::kRecordSeqnoTime),
+        seqno_time_cadence);
   }
+
   return s;
 #else
   return Status::OK();
@@ -1070,6 +1109,10 @@ void DBImpl::DumpStats() {
   PrintStatistics();
 }
 
+// Periodically flush info log out of application buffer at a low frequency.
+// This improves debuggability in case of RocksDB hanging since it ensures the
+// log messages leading up to the hang will eventually become visible in the
+// log.
 void DBImpl::FlushInfoLog() {
   if (shutdown_initiated_) {
     return;
@@ -1095,6 +1138,7 @@ Status DBImpl::TablesRangeTombstoneSummary(ColumnFamilyHandle* column_family,
 }
 
 void DBImpl::ScheduleBgLogWriterClose(JobContext* job_context) {
+  mutex_.AssertHeld();
   if (!job_context->logs_to_free.empty()) {
     for (auto l : job_context->logs_to_free) {
       AddToLogsToFreeQueue(l);
@@ -1261,17 +1305,36 @@ Status DBImpl::SetDBOptions(
         MaybeScheduleFlushOrCompaction();
       }
 
-      if (new_options.stats_dump_period_sec !=
-              mutable_db_options_.stats_dump_period_sec ||
-          new_options.stats_persist_period_sec !=
-              mutable_db_options_.stats_persist_period_sec) {
-        mutex_.Unlock();
-        periodic_work_scheduler_->Unregister(this);
-        s = periodic_work_scheduler_->Register(
-            this, new_options.stats_dump_period_sec,
-            new_options.stats_persist_period_sec);
-        mutex_.Lock();
+      mutex_.Unlock();
+      if (new_options.stats_dump_period_sec == 0) {
+        s = periodic_task_scheduler_.Unregister(PeriodicTaskType::kDumpStats);
+      } else {
+        s = periodic_task_scheduler_.Register(
+            PeriodicTaskType::kDumpStats,
+            periodic_task_functions_.at(PeriodicTaskType::kDumpStats),
+            new_options.stats_dump_period_sec);
       }
+      if (new_options.max_total_wal_size !=
+          mutable_db_options_.max_total_wal_size) {
+        max_total_wal_size_.store(new_options.max_total_wal_size,
+                                  std::memory_order_release);
+      }
+      if (s.ok()) {
+        if (new_options.stats_persist_period_sec == 0) {
+          s = periodic_task_scheduler_.Unregister(
+              PeriodicTaskType::kPersistStats);
+        } else {
+          s = periodic_task_scheduler_.Register(
+              PeriodicTaskType::kPersistStats,
+              periodic_task_functions_.at(PeriodicTaskType::kPersistStats),
+              new_options.stats_persist_period_sec);
+        }
+      }
+      mutex_.Lock();
+      if (!s.ok()) {
+        return s;
+      }
+
       write_controller_.set_max_delayed_write_rate(
           new_options.delayed_write_rate);
       table_cache_.get()->SetCapacity(new_options.max_open_files == -1
@@ -1392,7 +1455,7 @@ Status DBImpl::SyncWAL() {
   uint64_t current_log_number;
 
   {
-    InstrumentedMutexLock l(&mutex_);
+    InstrumentedMutexLock l(&log_write_mutex_);
     assert(!logs_.empty());
 
     // This SyncWAL() call only cares about logs up to this number.
@@ -1449,16 +1512,34 @@ Status DBImpl::SyncWAL() {
   TEST_SYNC_POINT("DBWALTest::SyncWALNotWaitWrite:2");
 
   TEST_SYNC_POINT("DBImpl::SyncWAL:BeforeMarkLogsSynced:1");
+  VersionEdit synced_wals;
   {
-    InstrumentedMutexLock l(&mutex_);
+    InstrumentedMutexLock l(&log_write_mutex_);
     if (status.ok()) {
-      status = MarkLogsSynced(current_log_number, need_log_dir_sync);
+      MarkLogsSynced(current_log_number, need_log_dir_sync, &synced_wals);
     } else {
       MarkLogsNotSynced(current_log_number);
     }
   }
+  if (status.ok() && synced_wals.IsWalAddition()) {
+    InstrumentedMutexLock l(&mutex_);
+    status = ApplyWALToManifest(&synced_wals);
+  }
+
   TEST_SYNC_POINT("DBImpl::SyncWAL:BeforeMarkLogsSynced:2");
 
+  return status;
+}
+
+Status DBImpl::ApplyWALToManifest(VersionEdit* synced_wals) {
+  // not empty, write to MANIFEST.
+  mutex_.AssertHeld();
+  Status status = versions_->LogAndApplyToDefaultColumnFamily(
+      synced_wals, &mutex_, directories_.GetDbDir());
+  if (!status.ok() && versions_->io_status().IsIOError()) {
+    status = error_handler_.SetBGError(versions_->io_status(),
+                                       BackgroundErrorReason::kManifestWrite);
+  }
   return status;
 }
 
@@ -1481,48 +1562,43 @@ Status DBImpl::UnlockWAL() {
   return Status::OK();
 }
 
-Status DBImpl::MarkLogsSynced(uint64_t up_to, bool synced_dir) {
-  mutex_.AssertHeld();
+void DBImpl::MarkLogsSynced(uint64_t up_to, bool synced_dir,
+                            VersionEdit* synced_wals) {
+  log_write_mutex_.AssertHeld();
   if (synced_dir && logfile_number_ == up_to) {
     log_dir_synced_ = true;
   }
-  VersionEdit synced_wals;
   for (auto it = logs_.begin(); it != logs_.end() && it->number <= up_to;) {
     auto& wal = *it;
     assert(wal.IsSyncing());
 
-    if (logs_.size() > 1) {
+    if (wal.number < logs_.back().number) {
+      // Inactive WAL
       if (immutable_db_options_.track_and_verify_wals_in_manifest &&
           wal.GetPreSyncSize() > 0) {
-        synced_wals.AddWal(wal.number, WalMetadata(wal.GetPreSyncSize()));
+        synced_wals->AddWal(wal.number, WalMetadata(wal.GetPreSyncSize()));
       }
-      logs_to_free_.push_back(wal.ReleaseWriter());
-      // To modify logs_ both mutex_ and log_write_mutex_ must be held
-      InstrumentedMutexLock l(&log_write_mutex_);
-      it = logs_.erase(it);
+      if (wal.GetPreSyncSize() == wal.writer->file()->GetFlushedSize()) {
+        // Fully synced
+        logs_to_free_.push_back(wal.ReleaseWriter());
+        it = logs_.erase(it);
+      } else {
+        assert(wal.GetPreSyncSize() < wal.writer->file()->GetFlushedSize());
+        wal.FinishSync();
+        ++it;
+      }
     } else {
+      assert(wal.number == logs_.back().number);
+      // Active WAL
       wal.FinishSync();
       ++it;
     }
   }
-  assert(logs_.empty() || logs_[0].number > up_to ||
-         (logs_.size() == 1 && !logs_[0].IsSyncing()));
-
-  Status s;
-  if (synced_wals.IsWalAddition()) {
-    // not empty, write to MANIFEST.
-    s = versions_->LogAndApplyToDefaultColumnFamily(&synced_wals, &mutex_);
-    if (!s.ok() && versions_->io_status().IsIOError()) {
-      s = error_handler_.SetBGError(versions_->io_status(),
-                                    BackgroundErrorReason::kManifestWrite);
-    }
-  }
   log_sync_cv_.SignalAll();
-  return s;
 }
 
 void DBImpl::MarkLogsNotSynced(uint64_t up_to) {
-  mutex_.AssertHeld();
+  log_write_mutex_.AssertHeld();
   for (auto it = logs_.begin(); it != logs_.end() && it->number <= up_to;
        ++it) {
     auto& wal = *it;
@@ -1646,9 +1722,16 @@ void DBImpl::BackgroundCallPurge() {
 }
 
 namespace {
-struct IterState {
-  IterState(DBImpl* _db, InstrumentedMutex* _mu, SuperVersion* _super_version,
-            bool _background_purge)
+
+// A `SuperVersionHandle` holds a non-null `SuperVersion*` pointing at a
+// `SuperVersion` referenced once for this object. It also contains the state
+// needed to clean up the `SuperVersion` reference from outside of `DBImpl`
+// using `CleanupSuperVersionHandle()`.
+struct SuperVersionHandle {
+  // `_super_version` must be non-nullptr and `Ref()`'d once as long as the
+  // `SuperVersionHandle` may use it.
+  SuperVersionHandle(DBImpl* _db, InstrumentedMutex* _mu,
+                     SuperVersion* _super_version, bool _background_purge)
       : db(_db),
         mu(_mu),
         super_version(_super_version),
@@ -1660,35 +1743,49 @@ struct IterState {
   bool background_purge;
 };
 
-static void CleanupIteratorState(void* arg1, void* /*arg2*/) {
-  IterState* state = reinterpret_cast<IterState*>(arg1);
+static void CleanupSuperVersionHandle(void* arg1, void* /*arg2*/) {
+  SuperVersionHandle* sv_handle = reinterpret_cast<SuperVersionHandle*>(arg1);
 
-  if (state->super_version->Unref()) {
+  if (sv_handle->super_version->Unref()) {
     // Job id == 0 means that this is not our background process, but rather
     // user thread
     JobContext job_context(0);
 
-    state->mu->Lock();
-    state->super_version->Cleanup();
-    state->db->FindObsoleteFiles(&job_context, false, true);
-    if (state->background_purge) {
-      state->db->ScheduleBgLogWriterClose(&job_context);
-      state->db->AddSuperVersionsToFreeQueue(state->super_version);
-      state->db->SchedulePurge();
+    sv_handle->mu->Lock();
+    sv_handle->super_version->Cleanup();
+    sv_handle->db->FindObsoleteFiles(&job_context, false, true);
+    if (sv_handle->background_purge) {
+      sv_handle->db->ScheduleBgLogWriterClose(&job_context);
+      sv_handle->db->AddSuperVersionsToFreeQueue(sv_handle->super_version);
+      sv_handle->db->SchedulePurge();
     }
-    state->mu->Unlock();
+    sv_handle->mu->Unlock();
 
-    if (!state->background_purge) {
-      delete state->super_version;
+    if (!sv_handle->background_purge) {
+      delete sv_handle->super_version;
     }
     if (job_context.HaveSomethingToDelete()) {
-      state->db->PurgeObsoleteFiles(job_context, state->background_purge);
+      sv_handle->db->PurgeObsoleteFiles(job_context,
+                                        sv_handle->background_purge);
     }
     job_context.Clean();
   }
 
+  delete sv_handle;
+}
+
+struct GetMergeOperandsState {
+  MergeContext merge_context;
+  PinnedIteratorsManager pinned_iters_mgr;
+  SuperVersionHandle* sv_handle;
+};
+
+static void CleanupGetMergeOperandsState(void* arg1, void* /*arg2*/) {
+  GetMergeOperandsState* state = static_cast<GetMergeOperandsState*>(arg1);
+  CleanupSuperVersionHandle(state->sv_handle /* arg1 */, nullptr /* arg2 */);
   delete state;
 }
+
 }  // namespace
 
 InternalIterator* DBImpl::NewInternalIterator(const ReadOptions& read_options,
@@ -1712,8 +1809,8 @@ InternalIterator* DBImpl::NewInternalIterator(const ReadOptions& read_options,
   std::unique_ptr<FragmentedRangeTombstoneIterator> range_del_iter;
   Status s;
   if (!read_options.ignore_range_deletions) {
-    range_del_iter.reset(
-        super_version->mem->NewRangeTombstoneIterator(read_options, sequence));
+    range_del_iter.reset(super_version->mem->NewRangeTombstoneIterator(
+        read_options, sequence, false /* immutable_memtable */));
     range_del_agg->AddTombstones(std::move(range_del_iter));
   }
   // Collect all needed child iterators for immutable memtables
@@ -1733,11 +1830,11 @@ InternalIterator* DBImpl::NewInternalIterator(const ReadOptions& read_options,
                                            allow_unprepared_value);
     }
     internal_iter = merge_iter_builder.Finish();
-    IterState* cleanup =
-        new IterState(this, &mutex_, super_version,
-                      read_options.background_purge_on_iterator_cleanup ||
-                      immutable_db_options_.avoid_unnecessary_blocking_io);
-    internal_iter->RegisterCleanup(CleanupIteratorState, cleanup, nullptr);
+    SuperVersionHandle* cleanup = new SuperVersionHandle(
+        this, &mutex_, super_version,
+        read_options.background_purge_on_iterator_cleanup ||
+            immutable_db_options_.avoid_unnecessary_blocking_io);
+    internal_iter->RegisterCleanup(CleanupSuperVersionHandle, cleanup, nullptr);
 
     return internal_iter;
   } else {
@@ -1773,10 +1870,61 @@ Status DBImpl::Get(const ReadOptions& read_options,
   return s;
 }
 
+Status DBImpl::GetEntity(const ReadOptions& read_options,
+                         ColumnFamilyHandle* column_family, const Slice& key,
+                         PinnableWideColumns* columns) {
+  if (!column_family) {
+    return Status::InvalidArgument(
+        "Cannot call GetEntity without a column family handle");
+  }
+
+  if (!columns) {
+    return Status::InvalidArgument(
+        "Cannot call GetEntity without a PinnableWideColumns object");
+  }
+
+  columns->Reset();
+
+  GetImplOptions get_impl_options;
+  get_impl_options.column_family = column_family;
+  get_impl_options.columns = columns;
+
+  return GetImpl(read_options, key, get_impl_options);
+}
+
+bool DBImpl::ShouldReferenceSuperVersion(const MergeContext& merge_context) {
+  // If both thresholds are reached, a function returning merge operands as
+  // `PinnableSlice`s should reference the `SuperVersion` to avoid large and/or
+  // numerous `memcpy()`s.
+  //
+  // The below constants enable the optimization conservatively. They are
+  // verified to not regress `GetMergeOperands()` latency in the following
+  // scenarios.
+  //
+  // - CPU: two socket Intel(R) Xeon(R) Gold 6138 CPU @ 2.00GHz
+  // - `GetMergeOperands()` threads: 1 - 32
+  // - Entry size: 32 bytes - 4KB
+  // - Merges per key: 1 - 16K
+  // - LSM component: memtable
+  //
+  // TODO(ajkr): expand measurement to SST files.
+  static const size_t kNumBytesForSvRef = 32768;
+  static const size_t kLog2AvgBytesForSvRef = 8;  // 256 bytes
+
+  size_t num_bytes = 0;
+  for (const Slice& sl : merge_context.GetOperands()) {
+    num_bytes += sl.size();
+  }
+  return num_bytes >= kNumBytesForSvRef &&
+         (num_bytes >> kLog2AvgBytesForSvRef) >=
+             merge_context.GetOperands().size();
+}
+
 Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
                        GetImplOptions& get_impl_options) {
   assert(get_impl_options.value != nullptr ||
-         get_impl_options.merge_operands != nullptr);
+         get_impl_options.merge_operands != nullptr ||
+         get_impl_options.columns != nullptr);
 
   assert(get_impl_options.column_family);
 
@@ -1817,6 +1965,14 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
     if (tracer_) {
       // TODO: maybe handle the tracing status?
       tracer_->Get(get_impl_options.column_family, key).PermitUncheckedError();
+    }
+  }
+
+  if (get_impl_options.get_merge_operands_options != nullptr) {
+    for (int i = 0; i < get_impl_options.get_merge_operands_options
+                            ->expected_max_number_of_operands;
+         ++i) {
+      get_impl_options.merge_operands[i].Reset();
     }
   }
 
@@ -1895,29 +2051,46 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
   if (!skip_memtable) {
     // Get value associated with key
     if (get_impl_options.get_value) {
-      if (sv->mem->Get(lkey, get_impl_options.value->GetSelf(), timestamp, &s,
-                       &merge_context, &max_covering_tombstone_seq,
-                       read_options, get_impl_options.callback,
-                       get_impl_options.is_blob_index)) {
+      if (sv->mem->Get(
+              lkey,
+              get_impl_options.value ? get_impl_options.value->GetSelf()
+                                     : nullptr,
+              get_impl_options.columns, timestamp, &s, &merge_context,
+              &max_covering_tombstone_seq, read_options,
+              false /* immutable_memtable */, get_impl_options.callback,
+              get_impl_options.is_blob_index)) {
         done = true;
-        get_impl_options.value->PinSelf();
+
+        if (get_impl_options.value) {
+          get_impl_options.value->PinSelf();
+        }
+
         RecordTick(stats_, MEMTABLE_HIT);
       } else if ((s.ok() || s.IsMergeInProgress()) &&
-                 sv->imm->Get(lkey, get_impl_options.value->GetSelf(),
-                              timestamp, &s, &merge_context,
-                              &max_covering_tombstone_seq, read_options,
-                              get_impl_options.callback,
+                 sv->imm->Get(lkey,
+                              get_impl_options.value
+                                  ? get_impl_options.value->GetSelf()
+                                  : nullptr,
+                              get_impl_options.columns, timestamp, &s,
+                              &merge_context, &max_covering_tombstone_seq,
+                              read_options, get_impl_options.callback,
                               get_impl_options.is_blob_index)) {
         done = true;
-        get_impl_options.value->PinSelf();
+
+        if (get_impl_options.value) {
+          get_impl_options.value->PinSelf();
+        }
+
         RecordTick(stats_, MEMTABLE_HIT);
       }
     } else {
       // Get Merge Operands associated with key, Merge Operands should not be
       // merged and raw values should be returned to the user.
-      if (sv->mem->Get(lkey, /*value*/ nullptr, /*timestamp=*/nullptr, &s,
-                       &merge_context, &max_covering_tombstone_seq,
-                       read_options, nullptr, nullptr, false)) {
+      if (sv->mem->Get(lkey, /*value=*/nullptr, /*columns=*/nullptr,
+                       /*timestamp=*/nullptr, &s, &merge_context,
+                       &max_covering_tombstone_seq, read_options,
+                       false /* immutable_memtable */, nullptr, nullptr,
+                       false)) {
         done = true;
         RecordTick(stats_, MEMTABLE_HIT);
       } else if ((s.ok() || s.IsMergeInProgress()) &&
@@ -1939,8 +2112,9 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
   if (!done) {
     PERF_TIMER_GUARD(get_from_output_files_time);
     sv->current->Get(
-        read_options, lkey, get_impl_options.value, timestamp, &s,
-        &merge_context, &max_covering_tombstone_seq, &pinned_iters_mgr,
+        read_options, lkey, get_impl_options.value, get_impl_options.columns,
+        timestamp, &s, &merge_context, &max_covering_tombstone_seq,
+        &pinned_iters_mgr,
         get_impl_options.get_value ? get_impl_options.value_found : nullptr,
         nullptr, nullptr,
         get_impl_options.get_value ? get_impl_options.callback : nullptr,
@@ -1956,7 +2130,11 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
     size_t size = 0;
     if (s.ok()) {
       if (get_impl_options.get_value) {
-        size = get_impl_options.value->size();
+        if (get_impl_options.value) {
+          size = get_impl_options.value->size();
+        } else if (get_impl_options.columns) {
+          size = get_impl_options.columns->serialized_size();
+        }
       } else {
         // Return all merge operands for get_impl_options.key
         *get_impl_options.number_of_operands =
@@ -1967,19 +2145,68 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
           s = Status::Incomplete(
               Status::SubCode::KMergeOperandsInsufficientCapacity);
         } else {
-          for (const Slice& sl : merge_context.GetOperands()) {
-            size += sl.size();
-            get_impl_options.merge_operands->PinSelf(sl);
-            get_impl_options.merge_operands++;
+          // Each operand depends on one of the following resources: `sv`,
+          // `pinned_iters_mgr`, or `merge_context`. It would be crazy expensive
+          // to reference `sv` for each operand relying on it because `sv` is
+          // (un)ref'd in all threads using the DB. Furthermore, we do not track
+          // on which resource each operand depends.
+          //
+          // To solve this, we bundle the resources in a `GetMergeOperandsState`
+          // and manage them with a `SharedCleanablePtr` shared among the
+          // `PinnableSlice`s we return. This bundle includes one `sv` reference
+          // and ownership of the `merge_context` and `pinned_iters_mgr`
+          // objects.
+          bool ref_sv = ShouldReferenceSuperVersion(merge_context);
+          if (ref_sv) {
+            assert(!merge_context.GetOperands().empty());
+            SharedCleanablePtr shared_cleanable;
+            GetMergeOperandsState* state = nullptr;
+            state = new GetMergeOperandsState();
+            state->merge_context = std::move(merge_context);
+            state->pinned_iters_mgr = std::move(pinned_iters_mgr);
+
+            sv->Ref();
+
+            state->sv_handle = new SuperVersionHandle(
+                this, &mutex_, sv,
+                immutable_db_options_.avoid_unnecessary_blocking_io);
+
+            shared_cleanable.Allocate();
+            shared_cleanable->RegisterCleanup(CleanupGetMergeOperandsState,
+                                              state /* arg1 */,
+                                              nullptr /* arg2 */);
+            for (size_t i = 0; i < state->merge_context.GetOperands().size();
+                 ++i) {
+              const Slice& sl = state->merge_context.GetOperands()[i];
+              size += sl.size();
+
+              get_impl_options.merge_operands->PinSlice(
+                  sl, nullptr /* cleanable */);
+              if (i == state->merge_context.GetOperands().size() - 1) {
+                shared_cleanable.MoveAsCleanupTo(
+                    get_impl_options.merge_operands);
+              } else {
+                shared_cleanable.RegisterCopyWith(
+                    get_impl_options.merge_operands);
+              }
+              get_impl_options.merge_operands++;
+            }
+          } else {
+            for (const Slice& sl : merge_context.GetOperands()) {
+              size += sl.size();
+              get_impl_options.merge_operands->PinSelf(sl);
+              get_impl_options.merge_operands++;
+            }
           }
         }
       }
       RecordTick(stats_, BYTES_READ, size);
       PERF_COUNTER_ADD(get_read_bytes, size);
     }
-    RecordInHistogram(stats_, BYTES_PER_READ, size);
 
     ReturnAndCleanupSuperVersion(cfd, sv);
+
+    RecordInHistogram(stats_, BYTES_PER_READ, size);
   }
   return s;
 }
@@ -2116,13 +2343,14 @@ std::vector<Status> DBImpl::MultiGet(
          has_unpersisted_data_.load(std::memory_order_relaxed));
     bool done = false;
     if (!skip_memtable) {
-      if (super_version->mem->Get(lkey, value, timestamp, &s, &merge_context,
-                                  &max_covering_tombstone_seq, read_options,
-                                  read_callback)) {
+      if (super_version->mem->Get(
+              lkey, value, /*columns=*/nullptr, timestamp, &s, &merge_context,
+              &max_covering_tombstone_seq, read_options,
+              false /* immutable_memtable */, read_callback)) {
         done = true;
         RecordTick(stats_, MEMTABLE_HIT);
-      } else if (super_version->imm->Get(lkey, value, timestamp, &s,
-                                         &merge_context,
+      } else if (super_version->imm->Get(lkey, value, /*columns=*/nullptr,
+                                         timestamp, &s, &merge_context,
                                          &max_covering_tombstone_seq,
                                          read_options, read_callback)) {
         done = true;
@@ -2133,9 +2361,9 @@ std::vector<Status> DBImpl::MultiGet(
       PinnableSlice pinnable_val;
       PERF_TIMER_GUARD(get_from_output_files_time);
       PinnedIteratorsManager pinned_iters_mgr;
-      super_version->current->Get(read_options, lkey, &pinnable_val, timestamp,
-                                  &s, &merge_context,
-                                  &max_covering_tombstone_seq,
+      super_version->current->Get(read_options, lkey, &pinnable_val,
+                                  /*columns=*/nullptr, timestamp, &s,
+                                  &merge_context, &max_covering_tombstone_seq,
                                   &pinned_iters_mgr, /*value_found=*/nullptr,
                                   /*key_exists=*/nullptr,
                                   /*seq=*/nullptr, read_callback);
@@ -2654,7 +2882,8 @@ Status DBImpl::MultiGetImpl(
         (read_options.read_tier == kPersistedTier &&
          has_unpersisted_data_.load(std::memory_order_relaxed));
     if (!skip_memtable) {
-      super_version->mem->MultiGet(read_options, &range, callback);
+      super_version->mem->MultiGet(read_options, &range, callback,
+                                   false /* immutable_memtable */);
       if (!range.empty()) {
         super_version->imm->MultiGet(read_options, &range, callback);
       }
@@ -2854,12 +3083,7 @@ Status DBImpl::CreateColumnFamilyImpl(const ColumnFamilyOptions& cf_options,
   }  // InstrumentedMutexLock l(&mutex_)
 
   if (cf_options.preclude_last_level_data_seconds > 0) {
-    // TODO(zjay): Fix the timer issue and re-enable this.
-    ROCKS_LOG_ERROR(
-        immutable_db_options_.info_log,
-        "Creating column family with `preclude_last_level_data_seconds` needs "
-        "to restart DB to take effect");
-    //    s = RegisterRecordSeqnoTimeWorker();
+    s = RegisterRecordSeqnoTimeWorker();
   }
   sv_context.Clean();
   // this is outside the mutex
@@ -2925,7 +3149,7 @@ Status DBImpl::DropColumnFamilyImpl(ColumnFamilyHandle* column_family) {
       WriteThread::Writer w;
       write_thread_.EnterUnbatched(&w, &mutex_);
       s = versions_->LogAndApply(cfd, *cfd->GetLatestMutableCFOptions(), &edit,
-                                 &mutex_);
+                                 &mutex_, directories_.GetDbDir());
       write_thread_.ExitUnbatched(&w);
     }
     if (s.ok()) {
@@ -4723,9 +4947,10 @@ Status DBImpl::GetLatestSequenceForKey(
   *found_record_for_key = false;
 
   // Check if there is a record for this key in the latest memtable
-  sv->mem->Get(lkey, /*value=*/nullptr, timestamp, &s, &merge_context,
-               &max_covering_tombstone_seq, seq, read_options,
-               nullptr /*read_callback*/, is_blob_index);
+  sv->mem->Get(lkey, /*value=*/nullptr, /*columns=*/nullptr, timestamp, &s,
+               &merge_context, &max_covering_tombstone_seq, seq, read_options,
+               false /* immutable_memtable */, nullptr /*read_callback*/,
+               is_blob_index);
 
   if (!(s.ok() || s.IsNotFound() || s.IsMergeInProgress())) {
     // unexpected error reading memtable.
@@ -4756,8 +4981,8 @@ Status DBImpl::GetLatestSequenceForKey(
   }
 
   // Check if there is a record for this key in the immutable memtables
-  sv->imm->Get(lkey, /*value=*/nullptr, timestamp, &s, &merge_context,
-               &max_covering_tombstone_seq, seq, read_options,
+  sv->imm->Get(lkey, /*value=*/nullptr, /*columns=*/nullptr, timestamp, &s,
+               &merge_context, &max_covering_tombstone_seq, seq, read_options,
                nullptr /*read_callback*/, is_blob_index);
 
   if (!(s.ok() || s.IsNotFound() || s.IsMergeInProgress())) {
@@ -4788,9 +5013,10 @@ Status DBImpl::GetLatestSequenceForKey(
   }
 
   // Check if there is a record for this key in the immutable memtables
-  sv->imm->GetFromHistory(lkey, /*value=*/nullptr, timestamp, &s,
-                          &merge_context, &max_covering_tombstone_seq, seq,
-                          read_options, is_blob_index);
+  sv->imm->GetFromHistory(lkey, /*value=*/nullptr, /*columns=*/nullptr,
+                          timestamp, &s, &merge_context,
+                          &max_covering_tombstone_seq, seq, read_options,
+                          is_blob_index);
 
   if (!(s.ok() || s.IsNotFound() || s.IsMergeInProgress())) {
     // unexpected error reading memtable.
@@ -4823,8 +5049,8 @@ Status DBImpl::GetLatestSequenceForKey(
   if (!cache_only) {
     // Check tables
     PinnedIteratorsManager pinned_iters_mgr;
-    sv->current->Get(read_options, lkey, /*value=*/nullptr, timestamp, &s,
-                     &merge_context, &max_covering_tombstone_seq,
+    sv->current->Get(read_options, lkey, /*value=*/nullptr, /*columns=*/nullptr,
+                     timestamp, &s, &merge_context, &max_covering_tombstone_seq,
                      &pinned_iters_mgr, nullptr /* value_found */,
                      found_record_for_key, seq, nullptr /*read_callback*/,
                      is_blob_index);
