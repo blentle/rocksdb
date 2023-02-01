@@ -8,6 +8,7 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include "db/arena_wrapped_db_iter.h"
+
 #include "memory/arena.h"
 #include "rocksdb/env.h"
 #include "rocksdb/iterator.h"
@@ -45,6 +46,7 @@ void ArenaWrappedDBIter::Init(
   sv_number_ = version_number;
   read_options_ = read_options;
   allow_refresh_ = allow_refresh;
+  memtable_range_tombstone_iter_ = nullptr;
 }
 
 Status ArenaWrappedDBIter::Refresh() {
@@ -89,18 +91,25 @@ Status ArenaWrappedDBIter::Refresh() {
       // Refresh range-tombstones in MemTable
       if (!read_options_.ignore_range_deletions) {
         SuperVersion* sv = cfd_->GetThreadLocalSuperVersion(db_impl_);
+        TEST_SYNC_POINT_CALLBACK("ArenaWrappedDBIter::Refresh:SV", nullptr);
         auto t = sv->mem->NewRangeTombstoneIterator(
             read_options_, latest_seq, false /* immutable_memtable */);
         if (!t || t->empty()) {
+          // If memtable_range_tombstone_iter_ points to a non-empty tombstone
+          // iterator, then it means sv->mem is not the memtable that
+          // memtable_range_tombstone_iter_ points to, so SV must have changed
+          // after the sv_number_ != cur_sv_number check above. We will fall
+          // back to re-init the InternalIterator, and the tombstone iterator
+          // will be freed during db_iter destruction there.
           if (memtable_range_tombstone_iter_) {
-            delete *memtable_range_tombstone_iter_;
-            *memtable_range_tombstone_iter_ = nullptr;
+            assert(!*memtable_range_tombstone_iter_ ||
+                   sv_number_ != cfd_->GetSuperVersionNumber());
           }
           delete t;
         } else {  // current mutable memtable has range tombstones
           if (!memtable_range_tombstone_iter_) {
             delete t;
-            cfd_->ReturnThreadLocalSuperVersion(sv);
+            db_impl_->ReturnAndCleanupSuperVersion(cfd_, sv);
             // The memtable under DBIter did not have range tombstone before
             // refresh.
             reinit_internal_iter();
@@ -112,7 +121,7 @@ Status ArenaWrappedDBIter::Refresh() {
                 &cfd_->internal_comparator(), nullptr, nullptr);
           }
         }
-        cfd_->ReturnThreadLocalSuperVersion(sv);
+        db_impl_->ReturnAndCleanupSuperVersion(cfd_, sv);
       }
       // Refresh latest sequence number
       db_iter_->set_sequence(latest_seq);

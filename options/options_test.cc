@@ -63,7 +63,6 @@ class UnregisteredTableFactory : public TableFactory {
   }
 };
 
-#ifndef ROCKSDB_LITE  // GetOptionsFromMap is not supported in ROCKSDB_LITE
 TEST_F(OptionsTest, GetOptionsFromMapTest) {
   std::unordered_map<std::string, std::string> cf_options_map = {
       {"write_buffer_size", "1"},
@@ -367,10 +366,7 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
   ASSERT_NOK(
       RocksDBOptionsParser::VerifyDBOptions(exact, base_db_opt, new_db_opt));
 }
-#endif  // !ROCKSDB_LITE
 
-#ifndef ROCKSDB_LITE  // GetColumnFamilyOptionsFromString is not supported in
-                      // ROCKSDB_LITE
 TEST_F(OptionsTest, GetColumnFamilyOptionsFromStringTest) {
   ColumnFamilyOptions base_cf_opt;
   ColumnFamilyOptions new_cf_opt;
@@ -613,7 +609,7 @@ TEST_F(OptionsTest, GetColumnFamilyOptionsFromStringTest) {
       &new_cf_opt));
   ASSERT_NE(new_cf_opt.blob_cache, nullptr);
   ASSERT_EQ(new_cf_opt.blob_cache->GetCapacity(), 1024UL * 1024UL);
-  ASSERT_EQ(static_cast<ShardedCache*>(new_cf_opt.blob_cache.get())
+  ASSERT_EQ(static_cast<ShardedCacheBase*>(new_cf_opt.blob_cache.get())
                 ->GetNumShardBits(),
             4);
   ASSERT_EQ(new_cf_opt.blob_cache->HasStrictCapacityLimit(), true);
@@ -896,9 +892,7 @@ TEST_F(OptionsTest, OldInterfaceTest) {
       RocksDBOptionsParser::VerifyDBOptions(exact, base_db_opt, new_db_opt));
 }
 
-#endif  // !ROCKSDB_LITE
 
-#ifndef ROCKSDB_LITE  // GetBlockBasedTableOptionsFromString is not supported
 TEST_F(OptionsTest, GetBlockBasedTableOptionsFromString) {
   BlockBasedTableOptions table_opt;
   BlockBasedTableOptions new_opt;
@@ -928,8 +922,6 @@ TEST_F(OptionsTest, GetBlockBasedTableOptionsFromString) {
   ASSERT_EQ(new_opt.checksum, ChecksumType::kxxHash);
   ASSERT_TRUE(new_opt.block_cache != nullptr);
   ASSERT_EQ(new_opt.block_cache->GetCapacity(), 1024UL*1024UL);
-  ASSERT_TRUE(new_opt.block_cache_compressed != nullptr);
-  ASSERT_EQ(new_opt.block_cache_compressed->GetCapacity(), 1024UL);
   ASSERT_EQ(new_opt.block_size, 1024UL);
   ASSERT_EQ(new_opt.block_size_deviation, 8);
   ASSERT_EQ(new_opt.block_restart_interval, 4);
@@ -1064,19 +1056,12 @@ TEST_F(OptionsTest, GetBlockBasedTableOptionsFromString) {
       &new_opt));
   ASSERT_TRUE(new_opt.block_cache != nullptr);
   ASSERT_EQ(new_opt.block_cache->GetCapacity(), 1024UL*1024UL);
-  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCache>(
-                new_opt.block_cache)->GetNumShardBits(), 4);
+  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCacheBase>(new_opt.block_cache)
+                ->GetNumShardBits(),
+            4);
   ASSERT_EQ(new_opt.block_cache->HasStrictCapacityLimit(), true);
   ASSERT_EQ(std::dynamic_pointer_cast<LRUCache>(
                 new_opt.block_cache)->GetHighPriPoolRatio(), 0.5);
-  ASSERT_TRUE(new_opt.block_cache_compressed != nullptr);
-  ASSERT_EQ(new_opt.block_cache_compressed->GetCapacity(), 1024UL*1024UL);
-  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCache>(
-                new_opt.block_cache_compressed)->GetNumShardBits(), 4);
-  ASSERT_EQ(new_opt.block_cache_compressed->HasStrictCapacityLimit(), true);
-  ASSERT_EQ(std::dynamic_pointer_cast<LRUCache>(
-                new_opt.block_cache_compressed)->GetHighPriPoolRatio(),
-                0.5);
 
   // Set only block cache capacity. Check other values are
   // reset to default values.
@@ -1088,22 +1073,11 @@ TEST_F(OptionsTest, GetBlockBasedTableOptionsFromString) {
   ASSERT_TRUE(new_opt.block_cache != nullptr);
   ASSERT_EQ(new_opt.block_cache->GetCapacity(), 2*1024UL*1024UL);
   // Default values
-  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCache>(
-                new_opt.block_cache)->GetNumShardBits(),
-                GetDefaultCacheShardBits(new_opt.block_cache->GetCapacity()));
+  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCacheBase>(new_opt.block_cache)
+                ->GetNumShardBits(),
+            GetDefaultCacheShardBits(new_opt.block_cache->GetCapacity()));
   ASSERT_EQ(new_opt.block_cache->HasStrictCapacityLimit(), false);
   ASSERT_EQ(std::dynamic_pointer_cast<LRUCache>(new_opt.block_cache)
-                ->GetHighPriPoolRatio(),
-            0.5);
-  ASSERT_TRUE(new_opt.block_cache_compressed != nullptr);
-  ASSERT_EQ(new_opt.block_cache_compressed->GetCapacity(), 2*1024UL*1024UL);
-  // Default values
-  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCache>(
-                new_opt.block_cache_compressed)->GetNumShardBits(),
-                GetDefaultCacheShardBits(
-                    new_opt.block_cache_compressed->GetCapacity()));
-  ASSERT_EQ(new_opt.block_cache_compressed->HasStrictCapacityLimit(), false);
-  ASSERT_EQ(std::dynamic_pointer_cast<LRUCache>(new_opt.block_cache_compressed)
                 ->GetHighPriPoolRatio(),
             0.5);
 
@@ -1115,19 +1089,12 @@ TEST_F(OptionsTest, GetBlockBasedTableOptionsFromString) {
       "high_pri_pool_ratio=0.0;}",
       &new_opt));
   ASSERT_EQ(new_opt.block_cache->GetCapacity(), 0);
-  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCache>(
-                new_opt.block_cache)->GetNumShardBits(), 5);
+  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCacheBase>(new_opt.block_cache)
+                ->GetNumShardBits(),
+            5);
   ASSERT_EQ(new_opt.block_cache->HasStrictCapacityLimit(), false);
   ASSERT_EQ(std::dynamic_pointer_cast<LRUCache>(
                 new_opt.block_cache)->GetHighPriPoolRatio(), 0.5);
-  ASSERT_TRUE(new_opt.block_cache_compressed != nullptr);
-  ASSERT_EQ(new_opt.block_cache_compressed->GetCapacity(), 0);
-  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCache>(
-                new_opt.block_cache_compressed)->GetNumShardBits(), 5);
-  ASSERT_EQ(new_opt.block_cache_compressed->HasStrictCapacityLimit(), false);
-  ASSERT_EQ(std::dynamic_pointer_cast<LRUCache>(new_opt.block_cache_compressed)
-                ->GetHighPriPoolRatio(),
-            0.0);
 
   // Set couple of block cache options.
   ASSERT_OK(GetBlockBasedTableOptionsFromString(
@@ -1139,18 +1106,11 @@ TEST_F(OptionsTest, GetBlockBasedTableOptionsFromString) {
       &new_opt));
   ASSERT_TRUE(new_opt.block_cache != nullptr);
   ASSERT_EQ(new_opt.block_cache->GetCapacity(), 1024UL*1024UL);
-  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCache>(
-                new_opt.block_cache)->GetNumShardBits(), 4);
+  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCacheBase>(new_opt.block_cache)
+                ->GetNumShardBits(),
+            4);
   ASSERT_EQ(new_opt.block_cache->HasStrictCapacityLimit(), true);
   ASSERT_EQ(std::dynamic_pointer_cast<LRUCache>(new_opt.block_cache)
-                ->GetHighPriPoolRatio(),
-            0.5);
-  ASSERT_TRUE(new_opt.block_cache_compressed != nullptr);
-  ASSERT_EQ(new_opt.block_cache_compressed->GetCapacity(), 1024UL*1024UL);
-  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCache>(
-                new_opt.block_cache_compressed)->GetNumShardBits(), 4);
-  ASSERT_EQ(new_opt.block_cache_compressed->HasStrictCapacityLimit(), true);
-  ASSERT_EQ(std::dynamic_pointer_cast<LRUCache>(new_opt.block_cache_compressed)
                 ->GetHighPriPoolRatio(),
             0.5);
 
@@ -1173,10 +1133,8 @@ TEST_F(OptionsTest, GetBlockBasedTableOptionsFromString) {
   ASSERT_TRUE(
       new_opt.filter_policy->IsInstanceOf(RibbonFilterPolicy::kNickName()));
 }
-#endif  // !ROCKSDB_LITE
 
 
-#ifndef ROCKSDB_LITE  // GetPlainTableOptionsFromString is not supported
 TEST_F(OptionsTest, GetPlainTableOptionsFromString) {
   PlainTableOptions table_opt;
   PlainTableOptions new_opt;
@@ -1217,9 +1175,7 @@ TEST_F(OptionsTest, GetPlainTableOptionsFromString) {
   ASSERT_NOK(s);
   ASSERT_TRUE(s.IsInvalidArgument());
 }
-#endif  // !ROCKSDB_LITE
 
-#ifndef ROCKSDB_LITE  // GetMemTableRepFactoryFromString is not supported
 TEST_F(OptionsTest, GetMemTableRepFactoryFromString) {
   std::unique_ptr<MemTableRepFactory> new_mem_factory = nullptr;
 
@@ -1256,7 +1212,6 @@ TEST_F(OptionsTest, GetMemTableRepFactoryFromString) {
 
   ASSERT_NOK(GetMemTableRepFactoryFromString("bad_factory", &new_mem_factory));
 }
-#endif  // !ROCKSDB_LITE
 
 TEST_F(OptionsTest, MemTableRepFactoryCreateFromString) {
   std::unique_ptr<MemTableRepFactory> new_mem_factory = nullptr;
@@ -1284,7 +1239,6 @@ TEST_F(OptionsTest, MemTableRepFactoryCreateFromString) {
   ASSERT_NOK(MemTableRepFactory::CreateFromString(
       config_options, "invalid_opt=10", &new_mem_factory));
 
-#ifndef ROCKSDB_LITE
   ASSERT_OK(MemTableRepFactory::CreateFromString(
       config_options, "id=skip_list; lookahead=32", &new_mem_factory));
   ASSERT_OK(MemTableRepFactory::CreateFromString(config_options, "prefix_hash",
@@ -1340,7 +1294,6 @@ TEST_F(OptionsTest, MemTableRepFactoryCreateFromString) {
       config_options, "id=vector; count=42", &new_mem_factory));
   ASSERT_NOK(MemTableRepFactory::CreateFromString(
       config_options, "id=vector; invalid=unknown", &new_mem_factory));
-#endif  // ROCKSDB_LITE
   ASSERT_NOK(MemTableRepFactory::CreateFromString(config_options, "cuckoo",
                                                   &new_mem_factory));
   // CuckooHash memtable is already removed.
@@ -1351,7 +1304,6 @@ TEST_F(OptionsTest, MemTableRepFactoryCreateFromString) {
                                                   &new_mem_factory));
 }
 
-#ifndef ROCKSDB_LITE  // GetOptionsFromString is not supported in RocksDB Lite
 class CustomEnv : public EnvWrapper {
  public:
   explicit CustomEnv(Env* _target) : EnvWrapper(_target) {}
@@ -1423,7 +1375,7 @@ TEST_F(OptionsTest, GetOptionsFromStringTest) {
   ASSERT_EQ(new_options.max_open_files, 1);
   ASSERT_TRUE(new_options.rate_limiter.get() != nullptr);
   Env* newEnv = new_options.env;
-  ASSERT_OK(Env::LoadEnv(CustomEnv::kClassName(), &newEnv));
+  ASSERT_OK(Env::CreateFromString({}, CustomEnv::kClassName(), &newEnv));
   ASSERT_EQ(newEnv, new_options.env);
 
   config_options.ignore_unknown_options = false;
@@ -1765,13 +1717,11 @@ TEST_F(OptionsTest, MutableCFOptions) {
   ASSERT_EQ(bbto->block_size, 32768);
 }
 
-#endif  // !ROCKSDB_LITE
 
 Status StringToMap(
     const std::string& opts_str,
     std::unordered_map<std::string, std::string>* opts_map);
 
-#ifndef ROCKSDB_LITE  // StringToMap is not supported in ROCKSDB_LITE
 TEST_F(OptionsTest, StringToMapTest) {
   std::unordered_map<std::string, std::string> opts_map;
   // Regular options
@@ -1888,9 +1838,7 @@ TEST_F(OptionsTest, StringToMapTest) {
   ASSERT_NOK(StringToMap("k1=v1;k2={{}}{}", &opts_map));
   ASSERT_NOK(StringToMap("k1=v1;k2={{dfdl}adfa}{}", &opts_map));
 }
-#endif  // ROCKSDB_LITE
 
-#ifndef ROCKSDB_LITE  // StringToMap is not supported in ROCKSDB_LITE
 TEST_F(OptionsTest, StringToMapRandomTest) {
   std::unordered_map<std::string, std::string> opts_map;
   // Make sure segfault is not hit by semi-random strings
@@ -2181,7 +2129,6 @@ TEST_F(OptionsTest, OptionTablePropertiesTest) {
   ASSERT_EQ(copy.table_properties_collector_factories.size(), 2);
   ASSERT_OK(RocksDBOptionsParser::VerifyCFOptions(cfg_opts, orig, copy));
 }
-#endif  // !ROCKSDB_LITE
 
 TEST_F(OptionsTest, ConvertOptionsTest) {
   LevelDBOptions leveldb_opt;
@@ -2206,7 +2153,6 @@ TEST_F(OptionsTest, ConvertOptionsTest) {
             leveldb_opt.block_restart_interval);
   ASSERT_EQ(table_opt->filter_policy.get(), leveldb_opt.filter_policy);
 }
-#ifndef ROCKSDB_LITE
 class TestEventListener : public EventListener {
  private:
   std::string id_;
@@ -2273,9 +2219,7 @@ TEST_F(OptionsTest, OptionsListenerTest) {
       2);  // The Test{Config}1 Listeners could be loaded but not the others
   ASSERT_OK(RocksDBOptionsParser::VerifyDBOptions(config_opts, orig, copy));
 }
-#endif  // ROCKSDB_LITE
 
-#ifndef ROCKSDB_LITE
 const static std::string kCustomEnvName = "Custom";
 const static std::string kCustomEnvProp = "env=" + kCustomEnvName;
 
@@ -2322,6 +2266,7 @@ TEST_F(OptionsOldApiTest, GetOptionsFromMapTest) {
       {"target_file_size_multiplier", "13"},
       {"max_bytes_for_level_base", "14"},
       {"level_compaction_dynamic_level_bytes", "true"},
+      {"level_compaction_dynamic_file_size", "true"},
       {"max_bytes_for_level_multiplier", "15.0"},
       {"max_bytes_for_level_multiplier_additional", "16:17:18"},
       {"max_compaction_bytes", "21"},
@@ -2458,6 +2403,7 @@ TEST_F(OptionsOldApiTest, GetOptionsFromMapTest) {
   ASSERT_EQ(new_cf_opt.target_file_size_multiplier, 13);
   ASSERT_EQ(new_cf_opt.max_bytes_for_level_base, 14U);
   ASSERT_EQ(new_cf_opt.level_compaction_dynamic_level_bytes, true);
+  ASSERT_EQ(new_cf_opt.level_compaction_dynamic_file_size, true);
   ASSERT_EQ(new_cf_opt.max_bytes_for_level_multiplier, 15.0);
   ASSERT_EQ(new_cf_opt.max_bytes_for_level_multiplier_additional.size(), 3U);
   ASSERT_EQ(new_cf_opt.max_bytes_for_level_multiplier_additional[0], 16);
@@ -2788,7 +2734,7 @@ TEST_F(OptionsOldApiTest, GetColumnFamilyOptionsFromStringTest) {
       &new_cf_opt));
   ASSERT_NE(new_cf_opt.blob_cache, nullptr);
   ASSERT_EQ(new_cf_opt.blob_cache->GetCapacity(), 1024UL * 1024UL);
-  ASSERT_EQ(static_cast<ShardedCache*>(new_cf_opt.blob_cache.get())
+  ASSERT_EQ(static_cast<ShardedCacheBase*>(new_cf_opt.blob_cache.get())
                 ->GetNumShardBits(),
             4);
   ASSERT_EQ(new_cf_opt.blob_cache->HasStrictCapacityLimit(), true);
@@ -2858,7 +2804,6 @@ TEST_F(OptionsTest, SliceTransformCreateFromString) {
   ASSERT_NOK(
       SliceTransform::CreateFromString(config_options, "invalid", &transform));
 
-#ifndef ROCKSDB_LITE
   ASSERT_OK(SliceTransform::CreateFromString(
       config_options, "rocksdb.CappedPrefix.11", &transform));
   ASSERT_NE(transform, nullptr);
@@ -2882,7 +2827,6 @@ TEST_F(OptionsTest, SliceTransformCreateFromString) {
   ASSERT_FALSE(transform->IsInstanceOf("capped:11"));
   ASSERT_FALSE(transform->IsInstanceOf("rocksdb.CappedPrefix"));
   ASSERT_FALSE(transform->IsInstanceOf("rocksdb.CappedPrefix.11"));
-#endif  // ROCKSDB_LITE
 }
 
 TEST_F(OptionsOldApiTest, GetBlockBasedTableOptionsFromString) {
@@ -2904,8 +2848,6 @@ TEST_F(OptionsOldApiTest, GetBlockBasedTableOptionsFromString) {
   ASSERT_TRUE(new_opt.no_block_cache);
   ASSERT_TRUE(new_opt.block_cache != nullptr);
   ASSERT_EQ(new_opt.block_cache->GetCapacity(), 1024UL*1024UL);
-  ASSERT_TRUE(new_opt.block_cache_compressed != nullptr);
-  ASSERT_EQ(new_opt.block_cache_compressed->GetCapacity(), 1024UL);
   ASSERT_EQ(new_opt.block_size, 1024UL);
   ASSERT_EQ(new_opt.block_size_deviation, 8);
   ASSERT_EQ(new_opt.block_restart_interval, 4);
@@ -2968,19 +2910,12 @@ TEST_F(OptionsOldApiTest, GetBlockBasedTableOptionsFromString) {
              &new_opt));
   ASSERT_TRUE(new_opt.block_cache != nullptr);
   ASSERT_EQ(new_opt.block_cache->GetCapacity(), 1024UL*1024UL);
-  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCache>(
-                new_opt.block_cache)->GetNumShardBits(), 4);
+  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCacheBase>(new_opt.block_cache)
+                ->GetNumShardBits(),
+            4);
   ASSERT_EQ(new_opt.block_cache->HasStrictCapacityLimit(), true);
   ASSERT_EQ(std::dynamic_pointer_cast<LRUCache>(
                 new_opt.block_cache)->GetHighPriPoolRatio(), 0.5);
-  ASSERT_TRUE(new_opt.block_cache_compressed != nullptr);
-  ASSERT_EQ(new_opt.block_cache_compressed->GetCapacity(), 1024UL*1024UL);
-  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCache>(
-                new_opt.block_cache_compressed)->GetNumShardBits(), 4);
-  ASSERT_EQ(new_opt.block_cache_compressed->HasStrictCapacityLimit(), true);
-  ASSERT_EQ(std::dynamic_pointer_cast<LRUCache>(
-                new_opt.block_cache_compressed)->GetHighPriPoolRatio(),
-                0.5);
 
   // Set only block cache capacity. Check other values are
   // reset to default values.
@@ -2991,22 +2926,11 @@ TEST_F(OptionsOldApiTest, GetBlockBasedTableOptionsFromString) {
   ASSERT_TRUE(new_opt.block_cache != nullptr);
   ASSERT_EQ(new_opt.block_cache->GetCapacity(), 2*1024UL*1024UL);
   // Default values
-  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCache>(
-                new_opt.block_cache)->GetNumShardBits(),
-                GetDefaultCacheShardBits(new_opt.block_cache->GetCapacity()));
+  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCacheBase>(new_opt.block_cache)
+                ->GetNumShardBits(),
+            GetDefaultCacheShardBits(new_opt.block_cache->GetCapacity()));
   ASSERT_EQ(new_opt.block_cache->HasStrictCapacityLimit(), false);
   ASSERT_EQ(std::dynamic_pointer_cast<LRUCache>(new_opt.block_cache)
-                ->GetHighPriPoolRatio(),
-            0.5);
-  ASSERT_TRUE(new_opt.block_cache_compressed != nullptr);
-  ASSERT_EQ(new_opt.block_cache_compressed->GetCapacity(), 2*1024UL*1024UL);
-  // Default values
-  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCache>(
-                new_opt.block_cache_compressed)->GetNumShardBits(),
-                GetDefaultCacheShardBits(
-                    new_opt.block_cache_compressed->GetCapacity()));
-  ASSERT_EQ(new_opt.block_cache_compressed->HasStrictCapacityLimit(), false);
-  ASSERT_EQ(std::dynamic_pointer_cast<LRUCache>(new_opt.block_cache_compressed)
                 ->GetHighPriPoolRatio(),
             0.5);
 
@@ -3018,19 +2942,12 @@ TEST_F(OptionsOldApiTest, GetBlockBasedTableOptionsFromString) {
       "high_pri_pool_ratio=0.0;}",
       &new_opt));
   ASSERT_EQ(new_opt.block_cache->GetCapacity(), 0);
-  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCache>(
-                new_opt.block_cache)->GetNumShardBits(), 5);
+  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCacheBase>(new_opt.block_cache)
+                ->GetNumShardBits(),
+            5);
   ASSERT_EQ(new_opt.block_cache->HasStrictCapacityLimit(), false);
   ASSERT_EQ(std::dynamic_pointer_cast<LRUCache>(
                 new_opt.block_cache)->GetHighPriPoolRatio(), 0.5);
-  ASSERT_TRUE(new_opt.block_cache_compressed != nullptr);
-  ASSERT_EQ(new_opt.block_cache_compressed->GetCapacity(), 0);
-  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCache>(
-                new_opt.block_cache_compressed)->GetNumShardBits(), 5);
-  ASSERT_EQ(new_opt.block_cache_compressed->HasStrictCapacityLimit(), false);
-  ASSERT_EQ(std::dynamic_pointer_cast<LRUCache>(new_opt.block_cache_compressed)
-                ->GetHighPriPoolRatio(),
-            0.0);
 
   // Set couple of block cache options.
   ASSERT_OK(GetBlockBasedTableOptionsFromString(table_opt,
@@ -3041,18 +2958,11 @@ TEST_F(OptionsOldApiTest, GetBlockBasedTableOptionsFromString) {
              &new_opt));
   ASSERT_TRUE(new_opt.block_cache != nullptr);
   ASSERT_EQ(new_opt.block_cache->GetCapacity(), 1024UL*1024UL);
-  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCache>(
-                new_opt.block_cache)->GetNumShardBits(), 4);
+  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCacheBase>(new_opt.block_cache)
+                ->GetNumShardBits(),
+            4);
   ASSERT_EQ(new_opt.block_cache->HasStrictCapacityLimit(), true);
   ASSERT_EQ(std::dynamic_pointer_cast<LRUCache>(new_opt.block_cache)
-                ->GetHighPriPoolRatio(),
-            0.5);
-  ASSERT_TRUE(new_opt.block_cache_compressed != nullptr);
-  ASSERT_EQ(new_opt.block_cache_compressed->GetCapacity(), 1024UL*1024UL);
-  ASSERT_EQ(std::dynamic_pointer_cast<ShardedCache>(
-                new_opt.block_cache_compressed)->GetNumShardBits(), 4);
-  ASSERT_EQ(new_opt.block_cache_compressed->HasStrictCapacityLimit(), true);
-  ASSERT_EQ(std::dynamic_pointer_cast<LRUCache>(new_opt.block_cache_compressed)
                 ->GetHighPriPoolRatio(),
             0.5);
 }
@@ -3158,7 +3068,7 @@ TEST_F(OptionsOldApiTest, GetOptionsFromStringTest) {
   ASSERT_EQ(new_options.max_open_files, 1);
   ASSERT_TRUE(new_options.rate_limiter.get() != nullptr);
   Env* newEnv = new_options.env;
-  ASSERT_OK(Env::LoadEnv("CustomEnvDefault", &newEnv));
+  ASSERT_OK(Env::CreateFromString({}, "CustomEnvDefault", &newEnv));
   ASSERT_EQ(newEnv, new_options.env);
 }
 
@@ -3204,9 +3114,7 @@ TEST_F(OptionsOldApiTest, ColumnFamilyOptionsSerialization) {
     delete base_opt.compaction_filter;
   }
 }
-#endif  // !ROCKSDB_LITE
 
-#ifndef ROCKSDB_LITE
 class OptionsParserTest : public testing::Test {
  public:
   OptionsParserTest() { fs_.reset(new test::StringFS(FileSystem::Default())); }
@@ -4978,11 +4886,11 @@ TEST_F(ConfigOptionsTest, ConfiguringOptionsDoesNotRevertRateLimiterBandwidth) {
 
 INSTANTIATE_TEST_CASE_P(OptionsSanityCheckTest, OptionsSanityCheckTest,
                         ::testing::Bool());
-#endif  // !ROCKSDB_LITE
 
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
+  ROCKSDB_NAMESPACE::port::InstallStackTraceHandler();
   ::testing::InitGoogleTest(&argc, argv);
 #ifdef GFLAGS
   ParseCommandLineFlags(&argc, &argv, true);

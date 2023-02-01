@@ -317,7 +317,9 @@ class DBIter final : public Iterator {
     wide_columns_.clear();
   }
 
-  Status Merge(const Slice* val, const Slice& user_key);
+  // If user-defined timestamp is enabled, `user_key` includes timestamp.
+  bool Merge(const Slice* val, const Slice& user_key);
+  bool MergeEntity(const Slice& entity, const Slice& user_key);
 
   const SliceTransform* prefix_extractor_;
   Env* const env_;
@@ -386,13 +388,7 @@ class DBIter final : public Iterator {
   MergeContext merge_context_;
   LocalStatistics local_stats_;
   PinnedIteratorsManager pinned_iters_mgr_;
-#ifdef ROCKSDB_LITE
-  ROCKSDB_FIELD_UNUSED
-#endif
   DBImpl* db_impl_;
-#ifdef ROCKSDB_LITE
-  ROCKSDB_FIELD_UNUSED
-#endif
   ColumnFamilyData* cfd_;
   const Slice* const timestamp_ub_;
   const Slice* const timestamp_lb_;
