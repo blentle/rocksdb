@@ -33,6 +33,7 @@
 
 #include "cache/cache_helpers.h"
 #include "db/blob/blob_file_meta.h"
+#include "db/blob/blob_index.h"
 #include "db/column_family.h"
 #include "db/compaction/compaction.h"
 #include "db/compaction/compaction_picker.h"
@@ -649,6 +650,12 @@ class VersionStorageInfo {
   // be empty. -1 if it is not level-compaction so it's not applicable.
   int base_level_;
 
+  // Applies to level compaction when
+  // `level_compaction_dynamic_level_bytes=true`. All non-empty levels <=
+  // lowest_unnecessary_level_ are not needed and will be drained automatically.
+  // -1 if there is no unnecessary level,
+  int lowest_unnecessary_level_;
+
   double level_multiplier_;
 
   // A list for the same set of files that are stored in files_,
@@ -889,8 +896,15 @@ class Version {
                  FilePrefetchBuffer* prefetch_buffer, PinnableSlice* value,
                  uint64_t* bytes_read) const;
 
-  using BlobReadContext =
-      std::pair<BlobIndex, std::reference_wrapper<const KeyContext>>;
+  struct BlobReadContext {
+    BlobReadContext(const BlobIndex& blob_idx, const KeyContext* key_ctx)
+        : blob_index(blob_idx), key_context(key_ctx) {}
+
+    BlobIndex blob_index;
+    const KeyContext* key_context;
+    PinnableSlice result;
+  };
+
   using BlobReadContexts = std::vector<BlobReadContext>;
   void MultiGetBlob(const ReadOptions& read_options, MultiGetRange& range,
                     std::unordered_map<uint64_t, BlobReadContexts>& blob_ctxs);
@@ -1067,6 +1081,7 @@ class Version {
   // used for debugging and logging purposes only.
   uint64_t version_number_;
   std::shared_ptr<IOTracer> io_tracer_;
+  bool use_async_io_;
 
   Version(ColumnFamilyData* cfd, VersionSet* vset, const FileOptions& file_opt,
           MutableCFOptions mutable_cf_options,
@@ -1195,7 +1210,7 @@ class VersionSet {
                                        uint64_t* manifest_file_number);
   void WakeUpWaitingManifestWriters();
 
-  // Recover the last saved descriptor from persistent storage.
+  // Recover the last saved descriptor (MANIFEST) from persistent storage.
   // If read_only == true, Recover() will not complain if some column families
   // are not opened
   Status Recover(const std::vector<ColumnFamilyDescriptor>& column_families,

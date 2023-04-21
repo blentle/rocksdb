@@ -287,9 +287,11 @@ class PersistentCacheFromCache : public PersistentCache {
 };
 
 class ReadOnlyCacheWrapper : public CacheWrapper {
+ public:
   using CacheWrapper::CacheWrapper;
 
-  using Cache::Insert;
+  const char* Name() const override { return "ReadOnlyCacheWrapper"; }
+
   Status Insert(const Slice& /*key*/, Cache::ObjectPtr /*value*/,
                 const CacheItemHelper* /*helper*/, size_t /*charge*/,
                 Handle** /*handle*/, Priority /*priority*/) override {
@@ -711,10 +713,11 @@ class LookupLiarCache : public CacheWrapper {
   explicit LookupLiarCache(std::shared_ptr<Cache> target)
       : CacheWrapper(std::move(target)) {}
 
-  using Cache::Lookup;
+  const char* Name() const override { return "LookupLiarCache"; }
+
   Handle* Lookup(const Slice& key, const CacheItemHelper* helper = nullptr,
                  CreateContext* create_context = nullptr,
-                 Priority priority = Priority::LOW, bool wait = true,
+                 Priority priority = Priority::LOW,
                  Statistics* stats = nullptr) override {
     if (nth_lookup_not_found_ == 1) {
       nth_lookup_not_found_ = 0;
@@ -723,8 +726,7 @@ class LookupLiarCache : public CacheWrapper {
     if (nth_lookup_not_found_ > 1) {
       --nth_lookup_not_found_;
     }
-    return CacheWrapper::Lookup(key, helper, create_context, priority, wait,
-                                stats);
+    return CacheWrapper::Lookup(key, helper, create_context, priority, stats);
   }
 
   // 1 == next lookup, 2 == after next, etc.

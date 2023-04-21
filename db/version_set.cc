@@ -23,7 +23,6 @@
 #include "db/blob/blob_fetcher.h"
 #include "db/blob/blob_file_cache.h"
 #include "db/blob/blob_file_reader.h"
-#include "db/blob/blob_index.h"
 #include "db/blob/blob_log_format.h"
 #include "db/blob/blob_source.h"
 #include "db/compaction/compaction.h"
@@ -39,6 +38,8 @@
 #include "db/table_cache.h"
 #include "db/version_builder.h"
 #include "db/version_edit_handler.h"
+#include "table/compaction_merging_iterator.h"
+
 #if USE_COROUTINES
 #include "folly/experimental/coro/BlockingWait.h"
 #include "folly/experimental/coro/Collect.h"
@@ -1775,6 +1776,8 @@ void Version::GetColumnFamilyMetaData(ColumnFamilyMetaData* cf_meta) {
           file->file_checksum, file->file_checksum_func_name);
       files.back().num_entries = file->num_entries;
       files.back().num_deletions = file->num_deletions;
+      files.back().smallest = file->smallest.Encode().ToString();
+      files.back().largest = file->largest.Encode().ToString();
       level_size += file->fd.GetFileSize();
     }
     cf_meta->levels.emplace_back(level, level_size, std::move(files));
@@ -2047,6 +2050,7 @@ VersionStorageInfo::VersionStorageInfo(
       compaction_style_(compaction_style),
       files_(new std::vector<FileMetaData*>[num_levels_]),
       base_level_(num_levels_ == 1 ? -1 : 1),
+      lowest_unnecessary_level_(-1),
       level_multiplier_(0.0),
       files_by_compaction_pri_(num_levels_),
       level0_non_overlapping_(false),
@@ -2118,7 +2122,8 @@ Version::Version(ColumnFamilyData* column_family_data, VersionSet* vset,
       max_file_size_for_l0_meta_pin_(
           MaxFileSizeForL0MetaPin(mutable_cf_options_)),
       version_number_(version_number),
-      io_tracer_(io_tracer) {}
+      io_tracer_(io_tracer),
+      use_async_io_(env_->GetFileSystem()->use_async_io()) {}
 
 Status Version::GetBlob(const ReadOptions& read_options, const Slice& user_key,
                         const Slice& blob_index_slice,
@@ -2177,26 +2182,35 @@ void Version::MultiGetBlob(
 
     autovector<BlobReadRequest> blob_reqs_in_file;
     BlobReadContexts& blobs_in_file = ctx.second;
-    for (const auto& blob : blobs_in_file) {
-      const BlobIndex& blob_index = blob.first;
-      const KeyContext& key_context = blob.second;
+    for (auto& blob : blobs_in_file) {
+      const BlobIndex& blob_index = blob.blob_index;
+      const KeyContext* const key_context = blob.key_context;
+      assert(key_context);
+      assert(key_context->get_context);
+      assert(key_context->s);
+
+      if (key_context->value) {
+        key_context->value->Reset();
+      } else {
+        assert(key_context->columns);
+        key_context->columns->Reset();
+      }
 
       if (!blob_file_meta) {
-        *key_context.s = Status::Corruption("Invalid blob file number");
+        *key_context->s = Status::Corruption("Invalid blob file number");
         continue;
       }
 
       if (blob_index.HasTTL() || blob_index.IsInlined()) {
-        *key_context.s =
+        *key_context->s =
             Status::Corruption("Unexpected TTL/inlined blob index");
         continue;
       }
 
-      key_context.value->Reset();
       blob_reqs_in_file.emplace_back(
-          key_context.get_context->ukey_to_get_blob_value(),
+          key_context->get_context->ukey_to_get_blob_value(),
           blob_index.offset(), blob_index.size(), blob_index.compression(),
-          key_context.value, key_context.s);
+          &blob.result, key_context->s);
     }
     if (blob_reqs_in_file.size() > 0) {
       const auto file_size = blob_file_meta->GetBlobFileSize();
@@ -2211,18 +2225,29 @@ void Version::MultiGetBlob(
 
   for (auto& ctx : blob_ctxs) {
     BlobReadContexts& blobs_in_file = ctx.second;
-    for (const auto& blob : blobs_in_file) {
-      const KeyContext& key_context = blob.second;
-      if (key_context.s->ok()) {
-        range.AddValueSize(key_context.value->size());
-        if (range.GetValueSize() > read_options.value_size_soft_limit) {
-          *key_context.s = Status::Aborted();
+    for (auto& blob : blobs_in_file) {
+      const KeyContext* const key_context = blob.key_context;
+      assert(key_context);
+      assert(key_context->get_context);
+      assert(key_context->s);
+
+      if (key_context->s->ok()) {
+        if (key_context->value) {
+          *key_context->value = std::move(blob.result);
+          range.AddValueSize(key_context->value->size());
+        } else {
+          assert(key_context->columns);
+          key_context->columns->SetPlainValue(std::move(blob.result));
+          range.AddValueSize(key_context->columns->serialized_size());
         }
-      } else if (key_context.s->IsIncomplete()) {
+
+        if (range.GetValueSize() > read_options.value_size_soft_limit) {
+          *key_context->s = Status::Aborted();
+        }
+      } else if (key_context->s->IsIncomplete()) {
         // read_options.read_tier == kBlockCacheTier
         // Cannot read blob(s): no disk I/O allowed
-        assert(key_context.get_context);
-        auto& get_context = *(key_context.get_context);
+        auto& get_context = *(key_context->get_context);
         get_context.MarkKeyMayExist();
       }
     }
@@ -2369,8 +2394,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
             *value = std::move(result);
           } else {
             assert(columns);
-            columns->Reset();
-            columns->SetPlainValue(result);
+            columns->SetPlainValue(std::move(result));
           }
         }
 
@@ -2387,6 +2411,9 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         *status = Status::NotSupported(
             "Encounter unexpected blob index. Please open DB with "
             "ROCKSDB_NAMESPACE::blob_db::BlobDB instead.");
+        return;
+      case GetContext::kMergeOperatorFailed:
+        *status = Status::Corruption(Status::SubCode::kMergeOperatorFailed);
         return;
     }
     f = fp.GetNextFile();
@@ -2421,7 +2448,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
           value->PinSelf();
         } else {
           assert(columns != nullptr);
-          columns->SetPlainValue(result);
+          columns->SetPlainValue(std::move(result));
         }
       }
     }
@@ -2457,7 +2484,7 @@ void Version::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
     get_ctx.emplace_back(
         user_comparator(), merge_operator_, info_log_, db_statistics_,
         iter->s->ok() ? GetContext::kNotFound : GetContext::kMerge,
-        iter->ukey_with_ts, iter->value, /*columns=*/nullptr, iter->timestamp,
+        iter->ukey_with_ts, iter->value, iter->columns, iter->timestamp,
         nullptr, &(iter->merge_context), true,
         &iter->max_covering_tombstone_seq, clock_, nullptr,
         merge_operator_ ? &pinned_iters_mgr : nullptr, callback,
@@ -2480,7 +2507,7 @@ void Version::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
   MultiGetRange keys_with_blobs_range(*range, range->begin(), range->end());
 #if USE_COROUTINES
   if (read_options.async_io && read_options.optimize_multiget_for_io &&
-      using_coroutines()) {
+      using_coroutines() && use_async_io_) {
     s = MultiGetAsync(read_options, range, &blob_ctxs);
   } else
 #endif  // USE_COROUTINES
@@ -2506,7 +2533,7 @@ void Version::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
       // Avoid using the coroutine version if we're looking in a L0 file, since
       // L0 files won't be parallelized anyway. The regular synchronous version
       // is faster.
-      if (!read_options.async_io || !using_coroutines() ||
+      if (!read_options.async_io || !using_coroutines() || !use_async_io_ ||
           fp.GetHitFileLevel() == 0 || !fp.RemainingOverlapInLevel()) {
         if (f) {
           bool skip_filters =
@@ -2657,23 +2684,29 @@ void Version::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
       }
       // merge_operands are in saver and we hit the beginning of the key history
       // do a final merge of nullptr and operands;
-      std::string* str_value =
-          iter->value != nullptr ? iter->value->GetSelf() : nullptr;
+      std::string result;
+
       // `op_failure_scope` (an output parameter) is not provided (set to
       // nullptr) since a failure must be propagated regardless of its value.
       *status = MergeHelper::TimedFullMerge(
           merge_operator_, user_key, nullptr, iter->merge_context.GetOperands(),
-          str_value, info_log_, db_statistics_, clock_,
+          &result, info_log_, db_statistics_, clock_,
           /* result_operand */ nullptr, /* update_num_ops_stats */ true,
           /* op_failure_scope */ nullptr);
       if (LIKELY(iter->value != nullptr)) {
+        *iter->value->GetSelf() = std::move(result);
         iter->value->PinSelf();
         range->AddValueSize(iter->value->size());
-        range->MarkKeyDone(iter);
-        if (range->GetValueSize() > read_options.value_size_soft_limit) {
-          s = Status::Aborted();
-          break;
-        }
+      } else {
+        assert(iter->columns);
+        iter->columns->SetPlainValue(std::move(result));
+        range->AddValueSize(iter->columns->serialized_size());
+      }
+
+      range->MarkKeyDone(iter);
+      if (range->GetValueSize() > read_options.value_size_soft_limit) {
+        s = Status::Aborted();
+        break;
       }
     } else {
       range->MarkKeyDone(iter);
@@ -3230,7 +3263,7 @@ void VersionStorageInfo::ComputeCompactionScore(
   // the level's target size, and 1.0 is the threshold for triggering
   // compaction. Higher score means higher prioritization.
   // Now we keep the compaction triggering condition, but consider more
-  // factors for priorization, while still keeping the 1.0 threshold.
+  // factors for prioritization, while still keeping the 1.0 threshold.
   // In order to provide flexibility for reducing score while still
   // maintaining it to be over 1.0, we scale the original score by 10x
   // if it is larger than 1.0.
@@ -3263,7 +3296,7 @@ void VersionStorageInfo::ComputeCompactionScore(
         // compaction score for the whole DB. Adding other levels as if
         // they are L0 files.
         for (int i = 1; i < num_levels(); i++) {
-          // Its possible that a subset of the files in a level may be in a
+          // It's possible that a subset of the files in a level may be in a
           // compaction, due to delete triggered compaction or trivial move.
           // In that case, the below check may not catch a level being
           // compacted as it only checks the first file. The worst that can
@@ -3312,7 +3345,7 @@ void VersionStorageInfo::ComputeCompactionScore(
               // When calculating estimated_compaction_needed_bytes, we assume
               // L0 is qualified as pending compactions. We will need to make
               // sure that it qualifies for compaction.
-              // It might be guafanteed by logic below anyway, but we are
+              // It might be guaranteed by logic below anyway, but we are
               // explicit here to make sure we don't stop writes with no
               // compaction scheduled.
               score = std::max(score, 1.01);
@@ -3341,7 +3374,7 @@ void VersionStorageInfo::ComputeCompactionScore(
           }
         }
       }
-    } else {
+    } else {  // level > 0
       // Compute the ratio of current size to size limit.
       uint64_t level_bytes_no_compacting = 0;
       uint64_t level_total_bytes = 0;
@@ -3351,21 +3384,36 @@ void VersionStorageInfo::ComputeCompactionScore(
           level_bytes_no_compacting += f->compensated_file_size;
         }
       }
-      if (!immutable_options.level_compaction_dynamic_level_bytes ||
-          level_bytes_no_compacting < MaxBytesForLevel(level)) {
+      if (!immutable_options.level_compaction_dynamic_level_bytes) {
         score = static_cast<double>(level_bytes_no_compacting) /
                 MaxBytesForLevel(level);
       } else {
-        // If there are a large mount of data being compacted down to the
-        // current level soon, we would de-prioritize compaction from
-        // a level where the incoming data would be a large ratio. We do
-        // it by dividing level size not by target level size, but
-        // the target size and the incoming compaction bytes.
-        score = static_cast<double>(level_bytes_no_compacting) /
-                (MaxBytesForLevel(level) + total_downcompact_bytes) *
-                kScoreScale;
+        if (level_bytes_no_compacting < MaxBytesForLevel(level)) {
+          score = static_cast<double>(level_bytes_no_compacting) /
+                  MaxBytesForLevel(level);
+        } else {
+          // If there are a large mount of data being compacted down to the
+          // current level soon, we would de-prioritize compaction from
+          // a level where the incoming data would be a large ratio. We do
+          // it by dividing level size not by target level size, but
+          // the target size and the incoming compaction bytes.
+          score = static_cast<double>(level_bytes_no_compacting) /
+                  (MaxBytesForLevel(level) + total_downcompact_bytes) *
+                  kScoreScale;
+        }
+        // Drain unnecessary levels, but with lower priority compared to
+        // when L0 is eligible. Only non-empty levels can be unnecessary.
+        // If there is no unnecessary levels, lowest_unnecessary_level_ = -1.
+        if (level_bytes_no_compacting > 0 &&
+            level <= lowest_unnecessary_level_) {
+          score = std::max(
+              score, kScoreScale *
+                         (1.001 + 0.001 * (lowest_unnecessary_level_ - level)));
+        }
       }
-      if (level_total_bytes > MaxBytesForLevel(level)) {
+      if (level <= lowest_unnecessary_level_) {
+        total_downcompact_bytes += level_total_bytes;
+      } else if (level_total_bytes > MaxBytesForLevel(level)) {
         total_downcompact_bytes +=
             static_cast<double>(level_total_bytes - MaxBytesForLevel(level));
       }
@@ -4438,6 +4486,7 @@ void VersionStorageInfo::CalculateBaseBytes(const ImmutableOptions& ioptions,
       }
     }
   } else {
+    assert(ioptions.compaction_style == kCompactionStyleLevel);
     uint64_t max_level_size = 0;
 
     int first_non_empty_level = -1;
@@ -4462,11 +4511,13 @@ void VersionStorageInfo::CalculateBaseBytes(const ImmutableOptions& ioptions,
       level_max_bytes_[i] = std::numeric_limits<uint64_t>::max();
     }
 
+    lowest_unnecessary_level_ = -1;
     if (max_level_size == 0) {
       // No data for L1 and up. L0 compacts to last level directly.
       // No compaction from L1+ needs to be scheduled.
       base_level_ = num_levels_ - 1;
     } else {
+      assert(first_non_empty_level >= 1);
       uint64_t base_bytes_max = options.max_bytes_for_level_base;
       uint64_t base_bytes_min = static_cast<uint64_t>(
           base_bytes_max / options.max_bytes_for_level_multiplier);
@@ -4477,20 +4528,41 @@ void VersionStorageInfo::CalculateBaseBytes(const ImmutableOptions& ioptions,
         // Round up after dividing
         cur_level_size = static_cast<uint64_t>(
             cur_level_size / options.max_bytes_for_level_multiplier);
+        if (lowest_unnecessary_level_ == -1 &&
+            cur_level_size <= base_bytes_min &&
+            (ioptions.preclude_last_level_data_seconds == 0 ||
+             i < num_levels_ - 2)) {
+          // When per_key_placement is enabled, the penultimate level is
+          // necessary.
+          lowest_unnecessary_level_ = i;
+        }
       }
 
       // Calculate base level and its size.
       uint64_t base_level_size;
       if (cur_level_size <= base_bytes_min) {
+        // If per_key_placement is not enabled,
+        // either there is only one non-empty level after level 0,
+        // which can less than base_bytes_min AND necessary,
+        // or there is some unnecessary level.
+        assert(first_non_empty_level == num_levels_ - 1 ||
+               ioptions.preclude_last_level_data_seconds > 0 ||
+               lowest_unnecessary_level_ != -1);
         // Case 1. If we make target size of last level to be max_level_size,
         // target size of the first non-empty level would be smaller than
         // base_bytes_min. We set it be base_bytes_min.
         base_level_size = base_bytes_min + 1U;
         base_level_ = first_non_empty_level;
-        ROCKS_LOG_INFO(ioptions.logger,
-                       "More existing levels in DB than needed. "
-                       "max_bytes_for_level_multiplier may not be guaranteed.");
+        if (base_level_ < num_levels_ - 1) {
+          ROCKS_LOG_INFO(
+              ioptions.logger,
+              "More existing levels in DB than needed: all non-zero "
+              "levels <= level %d are unnecessary.  "
+              "max_bytes_for_level_multiplier may not be guaranteed.",
+              lowest_unnecessary_level_);
+        }
       } else {
+        assert(lowest_unnecessary_level_ == -1);
         // Find base level (where L0 data is compacted to).
         base_level_ = first_non_empty_level;
         while (base_level_ > 1 && cur_level_size > base_bytes_max) {
@@ -6607,6 +6679,14 @@ InternalIterator* VersionSet::MakeInputIterator(
                                               c->num_input_levels() - 1
                                         : c->num_input_levels());
   InternalIterator** list = new InternalIterator*[space];
+  // First item in the pair is a pointer to range tombstones.
+  // Second item is a pointer to a member of a LevelIterator,
+  // that will be initialized to where CompactionMergingIterator stores
+  // pointer to its range tombstones. This is used by LevelIterator
+  // to update pointer to range tombstones as it traverse different SST files.
+  std::vector<
+      std::pair<TruncatedRangeDelIterator*, TruncatedRangeDelIterator***>>
+      range_tombstones;
   size_t num = 0;
   for (size_t which = 0; which < c->num_input_levels(); which++) {
     if (c->input_levels(which)->num_files != 0) {
@@ -6627,7 +6707,7 @@ InternalIterator* VersionSet::MakeInputIterator(
                   end.value(), fmd.smallest.user_key()) < 0) {
             continue;
           }
-
+          TruncatedRangeDelIterator* range_tombstone_iter = nullptr;
           list[num++] = cfd->table_cache()->NewIterator(
               read_options, file_options_compactions,
               cfd->internal_comparator(), fmd, range_del_agg,
@@ -6640,10 +6720,13 @@ InternalIterator* VersionSet::MakeInputIterator(
               MaxFileSizeForL0MetaPin(*c->mutable_cf_options()),
               /*smallest_compaction_key=*/nullptr,
               /*largest_compaction_key=*/nullptr,
-              /*allow_unprepared_value=*/false);
+              /*allow_unprepared_value=*/false,
+              /*range_del_iter=*/&range_tombstone_iter);
+          range_tombstones.emplace_back(range_tombstone_iter, nullptr);
         }
       } else {
         // Create concatenating iterator for the files from this level
+        TruncatedRangeDelIterator*** tombstone_iter_ptr = nullptr;
         list[num++] = new LevelIterator(
             cfd->table_cache(), read_options, file_options_compactions,
             cfd->internal_comparator(), c->input_levels(which),
@@ -6652,14 +6735,15 @@ InternalIterator* VersionSet::MakeInputIterator(
             /*no per level latency histogram=*/nullptr,
             TableReaderCaller::kCompaction, /*skip_filters=*/false,
             /*level=*/static_cast<int>(c->level(which)), range_del_agg,
-            c->boundaries(which));
+            c->boundaries(which), false, &tombstone_iter_ptr);
+        range_tombstones.emplace_back(nullptr, tombstone_iter_ptr);
       }
     }
   }
   assert(num <= space);
-  InternalIterator* result =
-      NewMergingIterator(&c->column_family_data()->internal_comparator(), list,
-                         static_cast<int>(num));
+  InternalIterator* result = NewCompactionMergingIterator(
+      &c->column_family_data()->internal_comparator(), list,
+      static_cast<int>(num), range_tombstones);
   delete[] list;
   return result;
 }

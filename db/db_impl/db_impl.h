@@ -277,32 +277,39 @@ class DBImpl : public DB {
   // The values and statuses parameters are arrays with number of elements
   // equal to keys.size(). This allows the storage for those to be alloacted
   // by the caller on the stack for small batches
-  virtual void MultiGet(const ReadOptions& options,
-                        ColumnFamilyHandle* column_family,
-                        const size_t num_keys, const Slice* keys,
-                        PinnableSlice* values, Status* statuses,
-                        const bool sorted_input = false) override;
-  virtual void MultiGet(const ReadOptions& options,
-                        ColumnFamilyHandle* column_family,
-                        const size_t num_keys, const Slice* keys,
-                        PinnableSlice* values, std::string* timestamps,
-                        Status* statuses,
-                        const bool sorted_input = false) override;
+  void MultiGet(const ReadOptions& options, ColumnFamilyHandle* column_family,
+                const size_t num_keys, const Slice* keys, PinnableSlice* values,
+                Status* statuses, const bool sorted_input = false) override;
+  void MultiGet(const ReadOptions& options, ColumnFamilyHandle* column_family,
+                const size_t num_keys, const Slice* keys, PinnableSlice* values,
+                std::string* timestamps, Status* statuses,
+                const bool sorted_input = false) override;
 
-  virtual void MultiGet(const ReadOptions& options, const size_t num_keys,
-                        ColumnFamilyHandle** column_families, const Slice* keys,
-                        PinnableSlice* values, Status* statuses,
-                        const bool sorted_input = false) override;
-  virtual void MultiGet(const ReadOptions& options, const size_t num_keys,
-                        ColumnFamilyHandle** column_families, const Slice* keys,
-                        PinnableSlice* values, std::string* timestamps,
-                        Status* statuses,
-                        const bool sorted_input = false) override;
+  void MultiGet(const ReadOptions& options, const size_t num_keys,
+                ColumnFamilyHandle** column_families, const Slice* keys,
+                PinnableSlice* values, Status* statuses,
+                const bool sorted_input = false) override;
+  void MultiGet(const ReadOptions& options, const size_t num_keys,
+                ColumnFamilyHandle** column_families, const Slice* keys,
+                PinnableSlice* values, std::string* timestamps,
+                Status* statuses, const bool sorted_input = false) override;
 
-  virtual void MultiGetWithCallback(
+  void MultiGetWithCallback(
       const ReadOptions& options, ColumnFamilyHandle* column_family,
       ReadCallback* callback,
       autovector<KeyContext*, MultiGetContext::MAX_BATCH_SIZE>* sorted_keys);
+
+  using DB::MultiGetEntity;
+
+  void MultiGetEntity(const ReadOptions& options,
+                      ColumnFamilyHandle* column_family, size_t num_keys,
+                      const Slice* keys, PinnableWideColumns* results,
+                      Status* statuses, bool sorted_input) override;
+
+  void MultiGetEntity(const ReadOptions& options, size_t num_keys,
+                      ColumnFamilyHandle** column_families, const Slice* keys,
+                      PinnableWideColumns* results, Status* statuses,
+                      bool sorted_input) override;
 
   virtual Status CreateColumnFamily(const ColumnFamilyOptions& cf_options,
                                     const std::string& column_family,
@@ -727,13 +734,17 @@ class DBImpl : public DB {
   // max_file_num_to_ignore allows bottom level compaction to filter out newly
   // compacted SST files. Setting max_file_num_to_ignore to kMaxUint64 will
   // disable the filtering
+  // If `final_output_level` is not nullptr, it is set to manual compaction's
+  // output level if returned status is OK, and it may or may not be set to
+  // manual compaction's output level if returned status is not OK.
   Status RunManualCompaction(ColumnFamilyData* cfd, int input_level,
                              int output_level,
                              const CompactRangeOptions& compact_range_options,
                              const Slice* begin, const Slice* end,
                              bool exclusive, bool disallow_trivial_move,
                              uint64_t max_file_num_to_ignore,
-                             const std::string& trim_ts);
+                             const std::string& trim_ts,
+                             int* final_output_level = nullptr);
 
   // Return an internal iterator over the current state of the database.
   // The keys of this iterator are internal keys (see format.h).
@@ -1074,8 +1085,9 @@ class DBImpl : public DB {
   // is because in certain cases, we can flush column families, wait for the
   // flush to complete, but delete the column family handle before the wait
   // finishes. For example in CompactRange.
-  Status TEST_AtomicFlushMemTables(const autovector<ColumnFamilyData*>& cfds,
-                                   const FlushOptions& flush_opts);
+  Status TEST_AtomicFlushMemTables(
+      const autovector<ColumnFamilyData*>& provided_candidate_cfds,
+      const FlushOptions& flush_opts);
 
   // Wait for background threads to complete scheduled work.
   Status TEST_WaitForBackgroundWork();
@@ -1879,16 +1891,27 @@ class DBImpl : public DB {
 
   Status SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context);
 
-  void SelectColumnFamiliesForAtomicFlush(autovector<ColumnFamilyData*>* cfds);
+  // Select and output column families qualified for atomic flush in
+  // `selected_cfds`. If `provided_candidate_cfds` is non-empty, it will be used
+  // as candidate CFs to select qualified ones from. Otherwise, all column
+  // families are used as candidate to select from.
+  //
+  // REQUIRES: mutex held
+  void SelectColumnFamiliesForAtomicFlush(
+      autovector<ColumnFamilyData*>* selected_cfds,
+      const autovector<ColumnFamilyData*>& provided_candidate_cfds = {});
 
   // Force current memtable contents to be flushed.
   Status FlushMemTable(ColumnFamilyData* cfd, const FlushOptions& options,
                        FlushReason flush_reason,
                        bool entered_write_thread = false);
 
+  // Atomic-flush memtables from quanlified CFs among `provided_candidate_cfds`
+  // (if non-empty) or amomg all column families and atomically record the
+  // result to the MANIFEST.
   Status AtomicFlushMemTables(
-      const autovector<ColumnFamilyData*>& column_family_datas,
       const FlushOptions& options, FlushReason flush_reason,
+      const autovector<ColumnFamilyData*>& provided_candidate_cfds = {},
       bool entered_write_thread = false);
 
   // Wait until flushing this column family won't stall writes
@@ -2190,6 +2213,18 @@ class DBImpl : public DB {
   void PrepareMultiGetKeys(
       const size_t num_keys, bool sorted,
       autovector<KeyContext*, MultiGetContext::MAX_BATCH_SIZE>* key_ptrs);
+
+  void MultiGetCommon(const ReadOptions& options,
+                      ColumnFamilyHandle* column_family, const size_t num_keys,
+                      const Slice* keys, PinnableSlice* values,
+                      PinnableWideColumns* columns, std::string* timestamps,
+                      Status* statuses, bool sorted_input);
+
+  void MultiGetCommon(const ReadOptions& options, const size_t num_keys,
+                      ColumnFamilyHandle** column_families, const Slice* keys,
+                      PinnableSlice* values, PinnableWideColumns* columns,
+                      std::string* timestamps, Status* statuses,
+                      bool sorted_input);
 
   // A structure to hold the information required to process MultiGet of keys
   // belonging to one column family. For a multi column family MultiGet, there
