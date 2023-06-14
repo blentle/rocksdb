@@ -59,30 +59,6 @@ enum CompactionPri : char {
   kRoundRobin = 0x4,
 };
 
-struct CompactionOptionsFIFO {
-  // once the total sum of table files reaches this, we will delete the oldest
-  // table file
-  // Default: 1GB
-  uint64_t max_table_files_size;
-
-  // If true, try to do compaction to compact smaller files into larger ones.
-  // Minimum files to compact follows options.level0_file_num_compaction_trigger
-  // and compaction won't trigger if average compact bytes per del file is
-  // larger than options.write_buffer_size. This is to protect large files
-  // from being compacted again.
-  // Default: false;
-  bool allow_compaction = false;
-
-  // When not 0, if the data in the file is older than this threshold, RocksDB
-  // will soon move the file to warm temperature.
-  uint64_t age_for_warm = 0;
-
-  CompactionOptionsFIFO() : max_table_files_size(1 * 1024 * 1024 * 1024) {}
-  CompactionOptionsFIFO(uint64_t _max_table_files_size, bool _allow_compaction)
-      : max_table_files_size(_max_table_files_size),
-        allow_compaction(_allow_compaction) {}
-};
-
 // Compression options for different compression algorithms like Zlib
 struct CompressionOptions {
   // ==> BEGIN options that can be set by deprecated configuration syntax, <==
@@ -223,6 +199,60 @@ enum class Temperature : uint8_t {
   kWarm = 0x08,
   kCold = 0x0C,
   kLastTemperature,
+};
+
+struct FileTemperatureAge {
+  Temperature temperature = Temperature::kUnknown;
+  uint64_t age = 0;
+};
+
+struct CompactionOptionsFIFO {
+  // once the total sum of table files reaches this, we will delete the oldest
+  // table file
+  // Default: 1GB
+  uint64_t max_table_files_size;
+
+  // If true, try to do compaction to compact smaller files into larger ones.
+  // Minimum files to compact follows options.level0_file_num_compaction_trigger
+  // and compaction won't trigger if average compact bytes per del file is
+  // larger than options.write_buffer_size. This is to protect large files
+  // from being compacted again.
+  // Default: false;
+  bool allow_compaction = false;
+
+  // DEPRECATED
+  // When not 0, if the data in the file is older than this threshold, RocksDB
+  // will soon move the file to warm temperature.
+  uint64_t age_for_warm = 0;
+
+  // EXPERIMENTAL
+  // Age (in seconds) threshold for different file temperatures.
+  // When not empty, each element specifies an age threshold `age` and a
+  // temperature such that if all the data in a file is older than `age`,
+  // RocksDB will compact the file to the specified `temperature`.
+  //
+  // Note:
+  // - Flushed files will always have temperature kUnknown.
+  // - Compaction output files will have temperature kUnknown by default, so
+  //   only temperatures other than kUnknown needs to be specified.
+  // - The elements should be in increasing order with respect to `age` field.
+  //
+  // Dynamically changeable through SetOptions() API, e.g.,
+  //   SetOptions("compaction_options_fifo",
+  //   "{file_temperature_age_thresholds={
+  //    {age=10;temperature=kWarm}:{age=20;temperature=kCold}}}")
+  // In this example, all files that are at least 20 seconds old will be
+  // compacted and output files will have temperature kCold. All files that are
+  // at least 10 seconds old but younger than 20 seconds will be compacted to
+  // files with temperature kWarm.
+  //
+  // Default: empty
+  std::vector<FileTemperatureAge> file_temperature_age_thresholds{};
+
+  CompactionOptionsFIFO() : max_table_files_size(1 * 1024 * 1024 * 1024) {}
+  CompactionOptionsFIFO(uint64_t _max_table_files_size, bool _allow_compaction)
+      : max_table_files_size(_max_table_files_size),
+        allow_compaction(_allow_compaction) {}
 };
 
 // The control option of how the cache tiers will be used. Currently rocksdb
@@ -1121,6 +1151,20 @@ struct AdvancedColumnFamilyOptions {
   // Not dynamically changeable, change it requires db restart and
   // only compatible changes are allowed.
   bool persist_user_defined_timestamps = true;
+
+  // Enable/disable per key-value checksum protection for in memory blocks.
+  //
+  // Checksum is constructed when a block is loaded into memory and verification
+  // is done for each key read from the block. This is useful for detecting
+  // in-memory data corruption. Note that this feature has a non-trivial
+  // negative impact on read performance. Different values of the
+  // option have similar performance impact, but different memory cost and
+  // corruption detection probability (e.g. 1 byte gives 255/256 chance for
+  // detecting a corruption).
+  //
+  // Default: 0 (no protection)
+  // Supported values: 0, 1, 2, 4, 8.
+  uint8_t block_protection_bytes_per_key = 0;
 
   // Create ColumnFamilyOptions with default values for all fields
   AdvancedColumnFamilyOptions();

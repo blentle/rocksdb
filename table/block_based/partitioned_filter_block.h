@@ -31,7 +31,8 @@ class PartitionedFilterBlockBuilder : public FullFilterBlockBuilder {
       FilterBitsBuilder* filter_bits_builder, int index_block_restart_interval,
       const bool use_value_delta_encoding,
       PartitionedIndexBuilder* const p_index_builder,
-      const uint32_t partition_size);
+      const uint32_t partition_size, size_t ts_sz,
+      const bool persist_user_defined_timestamps);
 
   virtual ~PartitionedFilterBlockBuilder();
 
@@ -166,11 +167,13 @@ class PartitionedFilterBlockReader
                          BlockCacheLookupContext* lookup_context,
                          const ReadOptions& read_options,
                          FilterManyFunction filter_function) const;
-  Status CacheDependencies(const ReadOptions& ro, bool pin) override;
+  Status CacheDependencies(const ReadOptions& ro, bool pin,
+                           FilePrefetchBuffer* tail_prefetch_buffer) override;
 
   const InternalKeyComparator* internal_comparator() const;
   bool index_key_includes_seq() const;
   bool index_value_is_full() const;
+  bool user_defined_timestamps_persisted() const;
 
  protected:
   // For partition blocks pinned in cache. Can be a subset of blocks

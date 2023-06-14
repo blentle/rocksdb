@@ -59,7 +59,7 @@
 #include "db/wide/wide_column_serialization.h"
 #include "db/write_batch_internal.h"
 #include "monitoring/perf_context_imp.h"
-#include "monitoring/statistics.h"
+#include "monitoring/statistics_impl.h"
 #include "port/lang.h"
 #include "rocksdb/merge_operator.h"
 #include "rocksdb/system_clock.h"
@@ -291,6 +291,12 @@ size_t WriteBatch::GetProtectionBytesPerKey() const {
     return prot_info_->GetBytesPerKey();
   }
   return 0;
+}
+
+std::string WriteBatch::Release() {
+  std::string ret = std::move(rep_);
+  Clear();
+  return ret;
 }
 
 bool WriteBatch::HasPut() const {
