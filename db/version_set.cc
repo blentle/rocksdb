@@ -39,6 +39,7 @@
 #include "db/version_builder.h"
 #include "db/version_edit.h"
 #include "db/version_edit_handler.h"
+#include "file/file_util.h"
 #include "table/compaction_merging_iterator.h"
 
 #if USE_COROUTINES
@@ -2190,7 +2191,12 @@ Version::Version(ColumnFamilyData* column_family_data, VersionSet* vset,
           MaxFileSizeForL0MetaPin(mutable_cf_options_)),
       version_number_(version_number),
       io_tracer_(io_tracer),
-      use_async_io_(env_->GetFileSystem()->use_async_io()) {}
+      use_async_io_(false) {
+  if (CheckFSFeatureSupport(env_->GetFileSystem().get(),
+                            FSSupportedOps::kAsyncIO)) {
+    use_async_io_ = true;
+  }
+}
 
 Status Version::GetBlob(const ReadOptions& read_options, const Slice& user_key,
                         const Slice& blob_index_slice,
@@ -3390,6 +3396,7 @@ void VersionStorageInfo::ComputeCompactionScore(
   // maintaining it to be over 1.0, we scale the original score by 10x
   // if it is larger than 1.0.
   const double kScoreScale = 10.0;
+  int max_output_level = MaxOutputLevel(immutable_options.allow_ingest_behind);
   for (int level = 0; level <= MaxInputLevel(); level++) {
     double score;
     if (level == 0) {
@@ -3417,7 +3424,7 @@ void VersionStorageInfo::ComputeCompactionScore(
         // For universal compaction, we use level0 score to indicate
         // compaction score for the whole DB. Adding other levels as if
         // they are L0 files.
-        for (int i = 1; i < num_levels(); i++) {
+        for (int i = 1; i <= max_output_level; i++) {
           // It's possible that a subset of the files in a level may be in a
           // compaction, due to delete triggered compaction or trivial move.
           // In that case, the below check may not catch a level being
@@ -3459,12 +3466,11 @@ void VersionStorageInfo::ComputeCompactionScore(
           // Level-based involves L0->L0 compactions that can lead to oversized
           // L0 files. Take into account size as well to avoid later giant
           // compactions to the base level.
-          // If score in L0 is always too high, L0->L1 will always be
-          // prioritized over L1->L2 compaction and L1 will accumulate to
-          // too large. But if L0 score isn't high enough, L0 will accumulate
-          // and data is not moved to L1 fast enough. With potential L0->L0
-          // compaction, number of L0 files aren't always an indication of
-          // L0 oversizing, and we also need to consider total size of L0.
+          // If score in L0 is always too high, L0->LBase will always be
+          // prioritized over LBase->LBase+1 compaction and LBase will
+          // accumulate to too large. But if L0 score isn't high enough, L0 will
+          // accumulate and data is not moved to LBase fast enough. The score
+          // calculation below takes into account L0 size vs LBase size.
           if (immutable_options.level_compaction_dynamic_level_bytes) {
             if (total_size >= mutable_cf_options.max_bytes_for_level_base) {
               // When calculating estimated_compaction_needed_bytes, we assume
@@ -3476,10 +3482,13 @@ void VersionStorageInfo::ComputeCompactionScore(
               score = std::max(score, 1.01);
             }
             if (total_size > level_max_bytes_[base_level_]) {
-              // In this case, we compare L0 size with actual L1 size and make
-              // sure score is more than 1.0 (10.0 after scaled) if L0 is larger
-              // than L1. Since in this case L1 score is lower than 10.0, L0->L1
-              // is prioritized over L1->L2.
+              // In this case, we compare L0 size with actual LBase size and
+              // make sure score is more than 1.0 (10.0 after scaled) if L0 is
+              // larger than LBase. Since LBase score = LBase size /
+              // (target size + total_downcompact_bytes) where
+              // total_downcompact_bytes = total_size > LBase size,
+              // LBase score is lower than 10.0. So L0->LBase is prioritized
+              // over LBase -> LBase+1.
               uint64_t base_level_size = 0;
               for (auto f : files_[base_level_]) {
                 base_level_size += f->compensated_file_size;
@@ -3561,16 +3570,18 @@ void VersionStorageInfo::ComputeCompactionScore(
       }
     }
   }
-  ComputeFilesMarkedForCompaction();
+  ComputeFilesMarkedForCompaction(max_output_level);
   if (!immutable_options.allow_ingest_behind) {
     ComputeBottommostFilesMarkedForCompaction();
   }
-  if (mutable_cf_options.ttl > 0) {
+  if (mutable_cf_options.ttl > 0 &&
+      compaction_style_ == kCompactionStyleLevel) {
     ComputeExpiredTtlFiles(immutable_options, mutable_cf_options.ttl);
   }
   if (mutable_cf_options.periodic_compaction_seconds > 0) {
     ComputeFilesMarkedForPeriodicCompaction(
-        immutable_options, mutable_cf_options.periodic_compaction_seconds);
+        immutable_options, mutable_cf_options.periodic_compaction_seconds,
+        max_output_level);
   }
 
   if (mutable_cf_options.enable_blob_garbage_collection &&
@@ -3584,14 +3595,14 @@ void VersionStorageInfo::ComputeCompactionScore(
   EstimateCompactionBytesNeeded(mutable_cf_options);
 }
 
-void VersionStorageInfo::ComputeFilesMarkedForCompaction() {
+void VersionStorageInfo::ComputeFilesMarkedForCompaction(int last_level) {
   files_marked_for_compaction_.clear();
   int last_qualify_level = 0;
 
   // Do not include files from the last level with data
   // If table properties collector suggests a file on the last level,
   // we should not move it to a new level.
-  for (int level = num_levels() - 1; level >= 1; level--) {
+  for (int level = last_level; level >= 1; level--) {
     if (!files_[level].empty()) {
       last_qualify_level = level - 1;
       break;
@@ -3635,7 +3646,7 @@ void VersionStorageInfo::ComputeExpiredTtlFiles(
 
 void VersionStorageInfo::ComputeFilesMarkedForPeriodicCompaction(
     const ImmutableOptions& ioptions,
-    const uint64_t periodic_compaction_seconds) {
+    const uint64_t periodic_compaction_seconds, int last_level) {
   assert(periodic_compaction_seconds > 0);
 
   files_marked_for_periodic_compaction_.clear();
@@ -3656,7 +3667,7 @@ void VersionStorageInfo::ComputeFilesMarkedForPeriodicCompaction(
   const uint64_t allowed_time_limit =
       current_time - periodic_compaction_seconds;
 
-  for (int level = 0; level < num_levels(); level++) {
+  for (int level = 0; level <= last_level; level++) {
     for (auto f : files_[level]) {
       if (!f->being_compacted) {
         // Compute a file's modification time in the following order:
@@ -4700,7 +4711,7 @@ void VersionStorageInfo::CalculateBaseBytes(const ImmutableOptions& ioptions,
           assert(base_level_ == 1);
           base_level_size = base_bytes_max;
         } else {
-          base_level_size = cur_level_size;
+          base_level_size = std::max(static_cast<uint64_t>(1), cur_level_size);
         }
       }
 
@@ -6449,7 +6460,8 @@ Status VersionSet::WriteCurrentStateToManifest(
                        f->oldest_blob_file_number, f->oldest_ancester_time,
                        f->file_creation_time, f->epoch_number, f->file_checksum,
                        f->file_checksum_func_name, f->unique_id,
-                       f->compensated_range_deletion_size, f->tail_size);
+                       f->compensated_range_deletion_size, f->tail_size,
+                       f->user_defined_timestamps_persisted);
         }
       }
 

@@ -146,6 +146,11 @@ TEST_F(DBWALTestWithEnrichedEnv, SkipDeletedWALs) {
   options.write_buffer_size = 128;
   Reopen(options);
 
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::PurgeObsoleteFiles:End",
+        "DBWALTestWithEnrichedEnv.SkipDeletedWALs:AfterFlush"}});
+  SyncPoint::GetInstance()->EnableProcessing();
+
   WriteOptions writeOpt = WriteOptions();
   for (int i = 0; i < 128 * 5; i++) {
     ASSERT_OK(dbfull()->Put(writeOpt, "foo", "v1"));
@@ -153,6 +158,8 @@ TEST_F(DBWALTestWithEnrichedEnv, SkipDeletedWALs) {
   FlushOptions fo;
   fo.wait = true;
   ASSERT_OK(db_->Flush(fo));
+
+  TEST_SYNC_POINT("DBWALTestWithEnrichedEnv.SkipDeletedWALs:AfterFlush");
 
   // some wals are deleted
   ASSERT_NE(0, enriched_env_->deleted_wal_cnt);
@@ -164,6 +171,8 @@ TEST_F(DBWALTestWithEnrichedEnv, SkipDeletedWALs) {
   Reopen(options);
   ASSERT_FALSE(enriched_env_->deleted_wal_reopened);
   ASSERT_FALSE(enriched_env_->gap_in_wals);
+
+  SyncPoint::GetInstance()->DisableProcessing();
 }
 
 TEST_F(DBWALTest, WAL) {
@@ -302,7 +311,9 @@ TEST_F(DBWALTest, Recover) {
   } while (ChangeWalOptions());
 }
 
-class DBWALTestWithTimestamp : public DBBasicTestWithTimestampBase {
+class DBWALTestWithTimestamp
+    : public DBBasicTestWithTimestampBase,
+      public testing::WithParamInterface<test::UserDefinedTimestampTestMode> {
  public:
   DBWALTestWithTimestamp()
       : DBBasicTestWithTimestampBase("db_wal_test_with_timestamp") {}
@@ -391,6 +402,54 @@ TEST_F(DBWALTestWithTimestamp, RecoverInconsistentTimestamp) {
   ASSERT_TRUE(
       ReopenColumnFamiliesWithTs({"pikachu"}, ts_options).IsInvalidArgument());
 }
+
+TEST_P(DBWALTestWithTimestamp, RecoverAndFlush) {
+  // Set up the option that enables user defined timestmp size.
+  std::string min_ts = Timestamp(0, 0);
+  std::string write_ts = Timestamp(1, 0);
+  const size_t kTimestampSize = write_ts.size();
+  TestComparator test_cmp(kTimestampSize);
+  Options ts_options;
+  ts_options.create_if_missing = true;
+  ts_options.comparator = &test_cmp;
+  bool persist_udt = test::ShouldPersistUDT(GetParam());
+  ts_options.persist_user_defined_timestamps = persist_udt;
+
+  std::string smallest_ukey_without_ts = "baz";
+  std::string largest_ukey_without_ts = "foo";
+
+  ASSERT_OK(CreateAndReopenWithCFWithTs({"pikachu"}, ts_options));
+  ASSERT_OK(Put(1, largest_ukey_without_ts, write_ts, "v1"));
+  ASSERT_OK(Put(1, smallest_ukey_without_ts, write_ts, "v5"));
+
+  // Very small write buffer size to force flush memtables recovered from WAL.
+  ts_options.write_buffer_size = 16;
+  ts_options.arena_block_size = 16;
+  ASSERT_OK(ReopenColumnFamiliesWithTs({"pikachu"}, ts_options));
+  ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "pikachu"),
+            static_cast<uint64_t>(1));
+
+  std::vector<std::vector<FileMetaData>> level_to_files;
+  dbfull()->TEST_GetFilesMetaData(handles_[1], &level_to_files);
+  ASSERT_GT(level_to_files.size(), 1);
+  // L0 only has one SST file.
+  ASSERT_EQ(level_to_files[0].size(), 1);
+  auto meta = level_to_files[0][0];
+  if (persist_udt) {
+    ASSERT_EQ(smallest_ukey_without_ts + write_ts, meta.smallest.user_key());
+    ASSERT_EQ(largest_ukey_without_ts + write_ts, meta.largest.user_key());
+  } else {
+    ASSERT_EQ(smallest_ukey_without_ts + min_ts, meta.smallest.user_key());
+    ASSERT_EQ(largest_ukey_without_ts + min_ts, meta.largest.user_key());
+  }
+}
+
+// Param 0: test mode for the user-defined timestamp feature
+INSTANTIATE_TEST_CASE_P(
+    RecoverAndFlush, DBWALTestWithTimestamp,
+    ::testing::Values(
+        test::UserDefinedTimestampTestMode::kStripUserDefinedTimestamp,
+        test::UserDefinedTimestampTestMode::kNormal));
 
 TEST_F(DBWALTest, RecoverWithTableHandle) {
   do {
